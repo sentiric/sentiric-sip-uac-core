@@ -1,0 +1,22 @@
+[package]
+name = "sentiric-sip-uac-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core logic library for SIP User Agent Clients (CLI & Mobile)."
+authors = ["Sentiric Team"]
+license = "AGPL-3.0"
+
+[dependencies]
+# --- THE IRON CORE ---
+sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.4.1" }
+sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.4.3" }
+
+# --- Async & Utilities ---
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+rand = "0.8"
+thiserror = "1.0"
+
+# --- Serialization (Event'ler için gerekebilir) ---
+serde = { version = "1.0", features = ["derive"] }
