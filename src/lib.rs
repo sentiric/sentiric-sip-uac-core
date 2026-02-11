@@ -1,63 +1,50 @@
 // sentiric-sip-uac-core/src/lib.rs
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::Arc; 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use sentiric_sip_core::{SipPacket, Method, Header, HeaderName, parser};
-use sentiric_rtp_core::{RtpHeader, RtpPacket, CodecFactory, Pacer, AudioProfile};
+use sentiric_rtp_core::{RtpHeader, RtpPacket, CodecFactory, Pacer, AudioProfile, AudioResampler};
 use rand::Rng;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ringbuf::HeapRb;
 
 /// İstemci (CLI/Mobile) tarafından dinlenecek olaylar.
 #[derive(Debug, Clone)]
 pub enum UacEvent {
-    Log(String),          // Genel bilgilendirme (DEBUG/INFO)
-    Status(String),       // Kullanıcıya gösterilecek durum (Ringing, Connected)
-    Error(String),        // Hata mesajı
-    CallEnded,            // Çağrı bitti
+    Log(String),          // Teknik loglar
+    Status(String),       // Kullanıcı dostu durum mesajları
+    Error(String),        // Hata durumları
+    CallEnded,            // Çağrı sonlanma sinyali
 }
 
-/// Çekirdek SIP İstemcisi
+/// Sentiric SIP İstemci Çekirdeği
 pub struct UacClient {
     event_tx: mpsc::Sender<UacEvent>,
 }
 
 impl UacClient {
-    /// Yeni bir istemci oluşturur. Olaylar `event_tx` kanalına gönderilir.
     pub fn new(event_tx: mpsc::Sender<UacEvent>) -> Self {
         Self { event_tx }
     }
 
-    /// Yardımcı: Olay gönderme
+    /// Olayları asenkron kanala güvenli bir şekilde basar.
     async fn emit(&self, event: UacEvent) {
         let _ = self.event_tx.send(event).await;
     }
 
-    /// Bir çağrı başlatır ve RTP akışını yönetir.
+    /// Belirtilen hedefe SIP çağrısı başlatır ve başarılı olursa donanım sesini açar.
     pub async fn start_call(&self, target_ip: String, target_port: u16, to_user: String, from_user: String) -> anyhow::Result<()> {
-        let local_port = 0; // 0 = İşletim sistemi rastgele boş port verir (Mobilde 6060 dolu olabilir)
-        
-        // Soket Bağlantısı
-        let socket = match UdpSocket::bind(format!("0.0.0.0:{}", local_port)).await {
-            Ok(s) => s,
-            Err(e) => {
-                self.emit(UacEvent::Error(format!("Socket bind failed: {}", e))).await;
-                return Err(e.into());
-            }
-        };
+        // İşletim sisteminden rastgele bir UDP portu al (0 verilerek OS'e bırakılır)
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let bound_port = socket.local_addr()?.port();
+        let target_addr: SocketAddr = format!("{}:{}", target_ip, target_port).parse()?;
 
-        // Gerçek atanan portu öğren
-        let local_addr = socket.local_addr()?;
-        let bound_port = local_addr.port();
-        
-        self.emit(UacEvent::Log(format!("Socket bound to local port: {}", bound_port))).await;
-
-        let target_addr_str = format!("{}:{}", target_ip, target_port);
-        let target_addr: SocketAddr = target_addr_str.parse()?;
-
-        // --- SIP INVITE Hazırlığı ---
-        let call_id = format!("uac-core-{}", rand::thread_rng().gen::<u32>());
-        let from = format!("<sip:{}@sentiric.mobile>;tag=uac-tag", from_user);
+        // --- SIP INVITE OLUŞTURMA ---
+        // RFC 3261 standartlarına uygun başlıklar
+        let call_id = format!("uac-hw-{}", rand::thread_rng().gen::<u32>());
+        let from = format!("<sip:{}@sentiric.mobile>;tag=uac-hw-tag", from_user);
         let to = format!("<sip:{}@{}>", to_user, target_ip);
         
         let mut invite = SipPacket::new_request(
@@ -65,8 +52,6 @@ impl UacClient {
             format!("sip:{}@{}:{}", to_user, target_ip, target_port)
         );
         
-        // IP tespiti mobilde zor olabilir, şimdilik 127.0.0.1 yerine 0.0.0.0 veya soft-coded bir değer kullanıyoruz.
-        // İdealde STUN gerekir ama test için bu yeterli.
         invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP 0.0.0.0:{};branch=z9hG4bK-{}", bound_port, rand::thread_rng().gen::<u16>())));
         invite.headers.push(Header::new(HeaderName::From, from.clone()));
         invite.headers.push(Header::new(HeaderName::To, to.clone()));
@@ -74,30 +59,29 @@ impl UacClient {
         invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
         invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@0.0.0.0:{}>", from_user, bound_port)));
         invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
-        invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-UAC-Core/1.0".to_string()));
+        invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-UAC-Hardware/1.0".to_string()));
 
-        // SDP (PCMU Only)
-        let sdp = format!("v=0\r\no=- 123 123 IN IP4 0.0.0.0\r\ns=SentiricMobile\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", bound_port+2); // RTP port tahmini
+        // SDP Tanımı: Sadece PCMU (8000Hz) kabul ediyoruz.
+        // Port tahmini (RTP portu sinyal portundan farklı olmalı)
+        let sdp = format!("v=0\r\no=- 123 123 IN IP4 0.0.0.0\r\ns=SentiricHW\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", bound_port+2);
         invite.body = sdp.as_bytes().to_vec();
 
-        self.emit(UacEvent::Status("Sending INVITE...".into())).await;
+        self.emit(UacEvent::Status("Dialing Hardware...".into())).await;
         socket.send_to(&invite.to_bytes(), target_addr).await?;
 
-        // --- Response Loop ---
+        // Yanıt Bekleme Döngüsü
         let mut buf = [0u8; 4096];
         loop {
             let (size, src) = socket.recv_from(&mut buf).await?;
             let packet = match parser::parse(&buf[..size]) {
                 Ok(p) => p,
-                Err(_) => continue, // Bozuk paket
+                Err(_) => continue,
             };
 
-            if packet.status_code >= 100 && packet.status_code < 200 {
-                self.emit(UacEvent::Status(format!("Server: {} {}", packet.status_code, packet.reason))).await;
-            } else if packet.status_code >= 200 && packet.status_code < 300 {
-                self.emit(UacEvent::Status("Call Answered! (200 OK)".into())).await;
+            if packet.status_code == 200 {
+                self.emit(UacEvent::Status("CONNECTED (Hardware Active)".into())).await;
                 
-                // ACK Gönder
+                // SIP ACK: Üçlü el sıkışmayı tamamla
                 let remote_tag = packet.get_header_value(HeaderName::To).cloned().unwrap_or(to.clone());
                 let mut ack = SipPacket::new_request(Method::Ack, format!("sip:{}", src));
                 ack.headers.push(Header::new(HeaderName::CallId, call_id.clone()));
@@ -107,17 +91,14 @@ impl UacClient {
                 ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP 0.0.0.0:{};branch=z9hG4bK-ack", bound_port)));
                 socket.send_to(&ack.to_bytes(), target_addr).await?;
 
-                // RTP Başlat (Basit Dummy Stream)
-                // Gerçek hedef portu SDP'den almak gerekir ama şimdilik sunucunun gönderdiği adrese (simetrik) güvenelim
-                // veya basitçe +2 port varsayalım (Geliştirilecek)
-                let rtp_target = SocketAddr::new(target_addr.ip(), 30000); // Varsayılan SBC RTP
-
-                self.emit(UacEvent::Status("Streaming Audio...".into())).await;
-                self.run_rtp_sequence(&socket, rtp_target).await?;
+                // --- HARDWARE AUDIO STREAM BAŞLAT ---
+                // Sentiric SBC standart olarak 30000 portundan RTP dinler.
+                let rtp_target = SocketAddr::new(target_addr.ip(), 30000);
+                self.run_hardware_audio_stream(socket, rtp_target).await?;
                 break;
             } else if packet.status_code >= 300 {
-                self.emit(UacEvent::Error(format!("Call Failed: {}", packet.status_code))).await;
-                return Err(anyhow::anyhow!("SIP Error"));
+                self.emit(UacEvent::Error(format!("Call Rejected: {}", packet.status_code))).await;
+                break;
             }
         }
         
@@ -125,29 +106,110 @@ impl UacClient {
         Ok(())
     }
 
-    async fn run_rtp_sequence(&self, socket: &UdpSocket, target: SocketAddr) -> anyhow::Result<()> {
-        let profile = AudioProfile::default();
-        let codec_type = profile.preferred_audio_codec();
-        let mut encoder = CodecFactory::create_encoder(codec_type);
-        let mut pacer = Pacer::new(profile.ptime as u64);
-        let ssrc: u32 = rand::thread_rng().gen();
-        let mut seq: u16 = 0;
-        let mut ts: u32 = 0;
-        let payload_size = 160;
+    /// Mikrofon verilerini RTP paketlerine çevirir ve gelen paketleri hoparlöre verir.
+    async fn run_hardware_audio_stream(&self, socket: UdpSocket, target: SocketAddr) -> anyhow::Result<()> {
+        let host = cpal::default_host();
+        let input_device = host.default_input_device().ok_or_else(|| anyhow::anyhow!("Microphone not found"))?;
+        let output_device = host.default_output_device().ok_or_else(|| anyhow::anyhow!("Speaker not found"))?;
 
-        // 5 Saniyelik ses gönder (Test için yeterli)
-        for _ in 0..250 {
+        let config: cpal::StreamConfig = input_device.default_input_config()?.into();
+        let sample_rate = config.sample_rate.0 as usize;
+
+        // 1. MİKROFON BUFFER (RingBuffer)
+        // --------------------------------
+        // Mikrofon callback'inden (Producer) veriyi alıp ana döngüye (Consumer) taşır.
+        let rb = HeapRb::<f32>::new(sample_rate * 2);
+        let (mut mic_prod, mut mic_cons) = rb.split();
+
+        let input_stream = input_device.build_input_stream(
+            &config,
+            move |data: &[f32], _: &_| {
+                for &sample in data { 
+                    // RingBuffer'a veriyi it. Yer yoksa atılır (gerçek zamanlı ses için doğru yaklaşım).
+                    let _ = mic_prod.push(sample); 
+                }
+            },
+            |err| eprintln!("Mic error: {}", err),
+            None
+        )?;
+
+        // 2. HOPARLÖR BUFFER (RingBuffer)
+        // --------------------------------
+        // Ana döngüden gelen veriyi (Producer) hoparlör callback'ine (Consumer) taşır.
+        let out_rb = HeapRb::<f32>::new(sample_rate * 2);
+        let (mut spk_prod, mut spk_cons) = out_rb.split();
+
+        let output_stream = output_device.build_output_stream(
+            &config,
+            move |data: &mut [f32], _: &_| {
+                for sample in data.iter_mut() {
+                    // Buffer'dan veri al, yoksa sessizlik (0.0) çal.
+                    *sample = spk_cons.pop().unwrap_or(0.0);
+                }
+            },
+            |err| eprintln!("Speaker error: {}", err),
+            None
+        )?;
+
+        // Donanımı fiziksel olarak başlat
+        input_stream.play()?;
+        output_stream.play()?;
+
+        // DSP ve Resampling Araçları (Iron Core üzerinden)
+        let profile = AudioProfile::default();
+        let mic_resampler = AudioResampler::new(sample_rate, 8000, 480);
+        let speaker_resampler = AudioResampler::new(8000, sample_rate, 160);
+        let mut encoder = CodecFactory::create_encoder(profile.preferred_audio_codec());
+        let mut decoder = CodecFactory::create_decoder(profile.preferred_audio_codec());
+
+        let arc_socket = Arc::new(socket);
+        let rtp_ssrc: u32 = rand::random();
+        let mut rtp_seq: u16 = 0;
+        let mut rtp_ts: u32 = 0;
+        let mut recv_buf = [0u8; 2048];
+        let mut pacer = Pacer::new(20); // 20ms paket zamanlaması
+
+        loop {
             pacer.wait();
-            let pcm = vec![0i16; payload_size]; 
-            let payload = encoder.encode(&pcm);
-            let mut header = RtpHeader::new(codec_type as u8, seq, ts, ssrc);
-            let rtp_pkt = RtpPacket { header, payload };
+
+            // A. Mikrofon -> RTP (TX)
+            // -----------------------
+            let mut mic_samples = Vec::new();
+            while let Some(s) = mic_cons.pop() { 
+                mic_samples.push((s * 32767.0) as i16); 
+            }
             
-            let _ = socket.send_to(&rtp_pkt.to_bytes(), target).await;
-            
-            seq = seq.wrapping_add(1);
-            ts = ts.wrapping_add(payload_size as u32);
+            if !mic_samples.is_empty() {
+                // Donanım hızından (örn: 48k) -> 8k'ya dönüştür.
+                let resampled = mic_resampler.process(&mic_samples).await;
+                // Codec (PCMU) ile sıkıştır.
+                let payload = encoder.encode(&resampled);
+                if !payload.is_empty() {
+                    let header = RtpHeader::new(0, rtp_seq, rtp_ts, rtp_ssrc);
+                    let pkt = RtpPacket { header, payload };
+                    let _ = arc_socket.send_to(&pkt.to_bytes(), target).await;
+                    rtp_seq = rtp_seq.wrapping_add(1);
+                    rtp_ts = rtp_ts.wrapping_add(160);
+                }
+            }
+
+            // B. Al -> Decode -> Hoparlör (RX)
+            // --------------------------------
+            // Ağdan gelen paketleri asenkron (non-blocking) kontrol et.
+            match arc_socket.try_recv_from(&mut recv_buf) {
+                Ok((size, _)) => {
+                    if let Ok(pkt) = parser::parse(&recv_buf[..size]) {
+                        // Sıkıştırılmış RTP payload'ını aç.
+                        let samples_8k = decoder.decode(&pkt.body);
+                        // 8k -> Donanım hızına (örn: 48k) dönüştür.
+                        let resampled = speaker_resampler.process(&samples_8k).await;
+                        for s in resampled { 
+                            let _ = spk_prod.push(s as f32 / 32768.0); 
+                        }
+                    }
+                },
+                _ => {} // Henüz yeni paket yok.
+            }
         }
-        Ok(())
     }
 }
