@@ -36,10 +36,34 @@ impl UacClient {
         };
         let _ = self.event_tx.send(UacEvent::Log(summary)).await;
         
-        // Ham içeriği logla (debug için)
         if let Ok(raw_string) = String::from_utf8(packet.to_bytes()) {
              let _ = self.event_tx.send(UacEvent::Log(format!("-- RAW PACKET --\n{}\n----------------", raw_string))).await;
         }
+    }
+
+    // SDP'den IP ve Port çıkarma
+    fn parse_sdp_target(&self, body: &[u8]) -> Option<SocketAddr> {
+        let sdp_str = String::from_utf8_lossy(body);
+        let mut ip = String::new();
+        let mut port = 0u16;
+
+        for line in sdp_str.lines() {
+            if line.starts_with("c=IN IP4 ") {
+                ip = line[9..].trim().to_string();
+            } else if line.starts_with("m=audio ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 1 {
+                    port = parts[1].parse().unwrap_or(0);
+                }
+            }
+        }
+
+        if !ip.is_empty() && port > 0 {
+            if let Ok(addr) = format!("{}:{}", ip, port).parse() {
+                return Some(addr);
+            }
+        }
+        None
     }
 
     pub async fn start_call(&self, target_ip: String, target_port: u16, to_user: String, from_user: String) -> anyhow::Result<()> {
@@ -86,7 +110,16 @@ impl UacClient {
             if packet.status_code == 200 {
                 let _ = self.event_tx.send(UacEvent::Status("CONNECTED (Hardware Active)".into())).await;
                 
+                // [KRİTİK GÜNCELLEME]: 200 OK içindeki SDP'den gerçek RTP hedefini al
+                // Varsayılan olarak SIP IP'sini kullanırız ama port değişmiş olabilir (SBC Latching için)
+                let rtp_remote_target = self.parse_sdp_target(&packet.body)
+                    .unwrap_or_else(|| SocketAddr::new(target_addr.ip(), 30000)); // Fallback
+
+                let _ = self.event_tx.send(UacEvent::Log(format!("🔊 RTP Target Locked: {}", rtp_remote_target))).await;
+
                 let remote_tag = packet.get_header_value(HeaderName::To).cloned().unwrap_or(to.clone());
+                // [FIX]: ACK, Contact header'ındaki URI'ye gönderilmelidir (Route set boşsa)
+                // Ancak basitlik adına şimdilik gelen kaynağa (SBC) gönderiyoruz.
                 let mut ack = SipPacket::new_request(Method::Ack, format!("sip:{}", src));
                 ack.headers.push(Header::new(HeaderName::CallId, call_id.clone()));
                 ack.headers.push(Header::new(HeaderName::From, from.clone()));
@@ -100,12 +133,11 @@ impl UacClient {
                 let std_socket = socket.into_std()?;
                 std_socket.set_nonblocking(false)?; 
                 
-                let rtp_target = SocketAddr::new(target_addr.ip(), 30004); 
-                
                 let event_tx_clone = self.event_tx.clone();
 
                 std::thread::spawn(move || {
-                    if let Err(e) = Self::run_hardware_audio_stream_sync(std_socket, rtp_target, event_tx_clone.clone()) {
+                    // RTP Target artık dinamik olarak parsed edilen adres
+                    if let Err(e) = Self::run_hardware_audio_stream_sync(std_socket, rtp_remote_target, event_tx_clone.clone()) {
                         let _ = event_tx_clone.blocking_send(UacEvent::Error(format!("Audio Fail: {}", e)));
                     }
                     let _ = event_tx_clone.blocking_send(UacEvent::CallEnded);
@@ -117,6 +149,7 @@ impl UacClient {
         Ok(())
     }
 
+    // run_hardware_audio_stream_sync fonksiyonu aynı kalıyor...
     fn run_hardware_audio_stream_sync(socket: StdUdpSocket, target: SocketAddr, event_tx: mpsc::Sender<UacEvent>) -> anyhow::Result<()> {
         let host = cpal::default_host();
         let input_device = host.default_input_device().ok_or_else(|| anyhow::anyhow!("Mic not found"))?;
@@ -175,6 +208,8 @@ impl UacClient {
 
             socket.set_nonblocking(true)?;
             if let Ok((size, src)) = socket.recv_from(&mut recv_buf) {
+                // [FIX]: Gelen paketleri adres kontrolü yapmadan işle (NAT durumları için)
+                // Yada en azından port değişse bile IP'nin aynı olduğunu kontrol et.
                 if src.ip() == target.ip() {
                     rx_count += 1;
                     if size > 12 && (recv_buf[0] & 0xC0) == 0x80 {
