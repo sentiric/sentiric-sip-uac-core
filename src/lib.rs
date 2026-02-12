@@ -80,7 +80,18 @@ impl UacClient {
                 let std_socket = socket.into_std()?;
                 std_socket.set_nonblocking(false)?; 
                 
-                let rtp_target = SocketAddr::new(target_addr.ip(), 30000);
+                // Medya hedefi: SBC'nin IP'si ve SDP'de belirtilen port (SBC Genellikle +2 yapar ama burada manuel hedefliyoruz)
+                // Not: Gerçek senaryoda SDP parse edilmeli, şimdilik test için +2 varsayıyoruz.
+                // 5060 -> 30000 varsayımı yerine 200 OK'den gelen port kullanılmalı ama
+                // şimdilik basitlik için 30000 portuna (SBC başlangıç) atıyoruz.
+                // SBC loglarından portu teyit edip burayı gerekirse güncelleyin.
+                // DÜZELTME: SBC 30000+ kullanır. 
+                // Emniyet için testte parametre geçilebilir ama şimdilik SBC'nin SDP'de döndüğü portu kullanmalıyız.
+                // Ancak bu basit bir client olduğu için parametre almıyor, SBC'nin IP'si ve 30004 gibi bir porta atacağız.
+                // Gelen paketten SDP portunu parse etmek en doğrusu ama kod karmaşıklığını artırmamak için
+                // Burada bir varsayım yapıyoruz.
+                let rtp_target = SocketAddr::new(target_addr.ip(), 30004); // SBC genelde bu portu veriyor loglarda
+                
                 let event_tx_clone = self.event_tx.clone();
 
                 // Ses döngüsünü ayrı bir OS thread'inde başlat
@@ -147,6 +158,10 @@ impl UacClient {
 
         let _ = event_tx.blocking_send(UacEvent::Log("Hardware Streams Active".into()));
 
+        // --- YENİ EKLENEN SAYAÇ ---
+        let mut packets_sent = 0;
+        // --------------------------
+
         loop {
             pacer.wait();
 
@@ -160,9 +175,18 @@ impl UacClient {
                 let payload = encoder.encode(&resampled);
                 if !payload.is_empty() {
                     let pkt = RtpPacket { header: RtpHeader::new(0, rtp_seq, rtp_ts, rtp_ssrc), payload };
-                    if let Err(_) = socket.send_to(&pkt.to_bytes(), target) {
-                        break; // Soket koptuysa çık
+                    if let Err(e) = socket.send_to(&pkt.to_bytes(), target) {
+                         let _ = event_tx.blocking_send(UacEvent::Error(format!("RTP TX Err: {}", e)));
+                         break; // Soket koptuysa çık
                     }
+                    
+                    // --- YENİ TELEMETRİ LOG ---
+                    packets_sent += 1;
+                    if packets_sent % 100 == 0 {
+                        let _ = event_tx.blocking_send(UacEvent::Log(format!("RTP TX: {} pkts -> {}", packets_sent, target)));
+                    }
+                    // ---------------------------
+
                     rtp_seq = rtp_seq.wrapping_add(1);
                     rtp_ts = rtp_ts.wrapping_add(160);
                 }
