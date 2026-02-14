@@ -2,7 +2,8 @@
 
 use crate::{CallState, ClientCommand, UacEvent};
 use crate::rtp_engine::RtpEngine;
-use crate::utils::extract_rtp_target;
+// ADIM 3: discover_local_ip eklendi
+use crate::utils::{extract_rtp_target, discover_local_ip}; 
 use sentiric_sip_core::{parser, Header, HeaderName, Method, SipPacket};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,37 +12,29 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn, error};
 
-/// Generated gRPC code from observer.proto
+// Telemetry Module (Önceki adımdan)
 pub mod observer_proto {
     tonic::include_proto!("sentiric.observer.v1");
 }
 use observer_proto::observer_service_client::ObserverServiceClient;
 use observer_proto::IngestLogRequest;
 
-/// `SipEngine` is the core stateful processor for all SIP/RTP operations.
-/// It manages connection life-cycles, retransmissions, and telemetry reporting.
 pub struct SipEngine {
     event_tx: mpsc::Sender<UacEvent>,
     command_rx: mpsc::Receiver<ClientCommand>,
     rtp_engine: Option<RtpEngine>,
     state: CallState,
-    
-    /// Telemetry stream to the Sentiric Observer
     telemetry_tx: mpsc::Sender<IngestLogRequest>,
-    /// Thread-safe client container for internal gRPC communication
     observer_client: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>,
 }
 
 impl SipEngine {
-    /// Creates a new instance of the engine and initializes the internal telemetry worker.
     pub async fn new(
         event_tx: mpsc::Sender<UacEvent>,
         command_rx: mpsc::Receiver<ClientCommand>,
     ) -> Self {
         let (tel_tx, tel_rx) = mpsc::channel::<IngestLogRequest>(500);
         let observer_client = Arc::new(Mutex::new(None));
-
-        // Start a persistent telemetry worker in the background
         Self::spawn_telemetry_worker(tel_rx, observer_client.clone());
 
         Self {
@@ -54,24 +47,20 @@ impl SipEngine {
         }
     }
 
-    /// Internal worker that consumes logs from the queue and pushes them to the Observer.
     fn spawn_telemetry_worker(
         mut rx: mpsc::Receiver<IngestLogRequest>, 
         client_container: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>
     ) {
         tokio::spawn(async move {
-            info!("📡 Telemetry background worker ready.");
             while let Some(req) = rx.recv().await {
                 let mut guard = client_container.lock().await;
                 if let Some(client) = guard.as_mut() {
-                    // Try to push log, ignore failure to prevent engine deadlock
                     let _ = client.ingest_log(req).await;
                 }
             }
         });
     }
 
-    /// Updates the engine state and broadcasts the change to the UI/CLI layers.
     fn change_state(&mut self, new_state: CallState) {
         if self.state != new_state {
             info!("State Transition: {:?} -> {:?}", self.state, new_state);
@@ -80,12 +69,8 @@ impl SipEngine {
         }
     }
 
-    /// Helper to report logs both locally and remotely.
     async fn log_step(&self, msg: String, level: &str, call_id: &str) {
-        // Local Dispatch
         let _ = self.event_tx.send(UacEvent::Log(msg.clone())).await;
-
-        // Remote Dispatch (Observer)
         let req = IngestLogRequest {
             service_name: "MOBILE-SDK".into(),
             message: msg,
@@ -96,8 +81,11 @@ impl SipEngine {
         let _ = self.telemetry_tx.try_send(req);
     }
 
-    /// The main execution loop of the SIP Engine.
     pub async fn run(&mut self) {
+        // [ADIM 3]: Cihazın gerçek ağ IP'sini keşfet
+        let local_ip = discover_local_ip();
+        info!("🕵️ Discovered Local IP: {}", local_ip);
+
         let socket = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => Arc::new(s),
             Err(e) => {
@@ -121,17 +109,13 @@ impl SipEngine {
         
         let mut invite_sent_time: Option<std::time::Instant> = None;
 
-        info!("🚀 Sentiric Telecom Engine initialized on: {:?}", socket.local_addr());
-
         loop {
             tokio::select! {
-                // Command processing
                 Some(cmd) = self.command_rx.recv() => {
                     match cmd {
                         ClientCommand::StartCall { target_ip, target_port, to_user, from_user } => {
                             if self.state != CallState::Idle { continue; }
                             
-                            // Initialize Telemetry connection for this session
                             let observer_url = format!("http://{}:11071", target_ip);
                             if let Ok(client) = ObserverServiceClient::connect(observer_url).await {
                                 let mut guard = self.observer_client.lock().await;
@@ -145,24 +129,33 @@ impl SipEngine {
                             current_cseq = 1;
 
                             let bound_port = socket.local_addr().unwrap().port();
+                            
+                            // [ADIM 3]: 0.0.0.0 yerine keşfedilen local_ip kullanılıyor
                             let mut invite = SipPacket::new_request(Method::Invite, format!("sip:{}@{}:{}", to_user, target_ip, target_port));
                             let branch = sentiric_sip_core::utils::generate_branch_id();
 
-                            // Set Mandatory Headers
-                            invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP 0.0.0.0:{};branch={}", bound_port, branch)));
+                            invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={}", local_ip, bound_port, branch)));
                             invite.headers.push(Header::new(HeaderName::From, format!("<sip:{}@sentiric.mobile>;tag={}", from_user, current_from_tag)));
                             invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}@{}>", to_user, target_ip)));
                             invite.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                             invite.headers.push(Header::new(HeaderName::CSeq, format!("{} INVITE", current_cseq)));
-                            invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@0.0.0.0:{}>", from_user, bound_port)));
+                            invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", from_user, local_ip, bound_port)));
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                             invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Telecom-SDK/2.1".to_string()));
 
-                            // Construct RFC-compliant SDP
                             let now = chrono::Utc::now().timestamp();
                             let sdp = format!(
-                                "v=0\r\no=- {} {} IN IP4 0.0.0.0\r\ns=Sentiric Session\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
-                                now, now, bound_port
+                                "v=0\r\n\
+                                 o=- {} {} IN IP4 {}\r\n\
+                                 s=Sentiric Session\r\n\
+                                 c=IN IP4 {}\r\n\
+                                 t=0 0\r\n\
+                                 m=audio {} RTP/AVP 0 101\r\n\
+                                 a=rtpmap:0 PCMU/8000\r\n\
+                                 a=rtpmap:101 telephone-event/8000\r\n\
+                                 a=sendrecv\r\n\
+                                 a=ptime:20\r\n", 
+                                now, now, local_ip, local_ip, bound_port
                             );
                             invite.body = sdp.as_bytes().to_vec();
 
@@ -179,7 +172,15 @@ impl SipEngine {
                              last_invite_packet = None;
                              if self.state != CallState::Idle {
                                 if let Some(target) = current_target {
-                                    let bye = SipPacket::new_request(Method::Bye, format!("sip:{}", target));
+                                    let mut bye = SipPacket::new_request(Method::Bye, format!("sip:{}", target));
+                                    let branch = sentiric_sip_core::utils::generate_branch_id();
+                                    // ADIM 3: BYE mesajında da local_ip kullanımı
+                                    bye.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:0;branch={}", local_ip, branch)));
+                                    bye.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
+                                    bye.headers.push(Header::new(HeaderName::To, format!("<sip:server>;tag={}", current_to_tag))); 
+                                    bye.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
+                                    bye.headers.push(Header::new(HeaderName::CSeq, format!("{} BYE", current_cseq)));
+                                    
                                     let _ = socket.send_to(&bye.to_bytes(), target).await;
                                     self.log_step("📤 BYE Sent".into(), "INFO", &current_call_id).await;
                                 }
@@ -191,7 +192,6 @@ impl SipEngine {
                     }
                 },
 
-                // Network Inbound processing
                 Ok((size, src)) = socket.recv_from(&mut buf) => {
                     if size < 4 || (buf[0] & 0x80) != 0 { continue; }
 
@@ -200,7 +200,6 @@ impl SipEngine {
 
                     if let Ok(packet) = parser::parse(&buf[..size]) {
                          if packet.is_response() && packet.status_code >= 100 {
-                             // Stop retransmitting once server responds
                              last_invite_packet = None; 
                          }
 
@@ -216,7 +215,8 @@ impl SipEngine {
                              let branch = sentiric_sip_core::utils::generate_branch_id();
                              let bound_port = socket.local_addr().unwrap().port();
                              
-                             ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP 0.0.0.0:{};branch={}", bound_port, branch)));
+                             // ADIM 3: ACK mesajında da local_ip kullanımı
+                             ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={}", local_ip, bound_port, branch)));
                              ack.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
                              ack.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
                              ack.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
@@ -231,7 +231,6 @@ impl SipEngine {
                     }
                 },
 
-                // Timers and Retransmissions
                 _ = retransmit_interval.tick() => {
                     if let Some(packet) = &last_invite_packet {
                         if let Some(target) = current_target {
