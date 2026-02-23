@@ -1,6 +1,6 @@
 [package]
 name = "sentiric-telecom-client-sdk"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 authors = ["Sentiric Team <dev@sentiric.ai>"]
 description = "Hardened Stateful SIP/RTP Engine with Real-time Media Telemetry"
@@ -11,7 +11,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 # --- THE IRON CORE ---
 sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.5.0" }
-sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.5.5" }
+sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.5.6" }
 
 # --- Async & Network ---
 tokio = { version = "1", features = ["full"] }
