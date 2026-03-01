@@ -1,11 +1,10 @@
 // sentiric-telecom-client-sdk/src/rtp_engine.rs
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket}; // std::net kullanılıyor
 use std::sync::Arc;
-use tokio::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use ringbuf::HeapRb;
-use tracing::{info, error, warn, debug};
+use tracing::{info, error, debug};
 use sentiric_rtp_core::{AudioProfile, CodecFactory, Pacer, RtpHeader, RtpPacket, simple_resample};
 use std::panic;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -13,7 +12,7 @@ use tokio::sync::mpsc;
 use crate::UacEvent; 
 
 pub struct RtpEngine {
-    socket: Arc<UdpSocket>,
+    socket: Arc<UdpSocket>, // Artık std soketi
     is_running: Arc<AtomicBool>,
     pub rx_count: Arc<AtomicU64>,
     pub tx_count: Arc<AtomicU64>,
@@ -124,7 +123,7 @@ fn run_headless_loop(
         let payload = encoder.encode(&silence_frame);
         let header = RtpHeader::new(payload_type, seq, ts, ssrc);
         let packet = RtpPacket { header, payload };
-        let _ = socket.try_send_to(&packet.to_bytes(), target);
+        let _ = socket.send_to(&packet.to_bytes(), target); // std::net method
         std::thread::sleep(std::time::Duration::from_millis(20));
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(sample_per_frame as u32);
@@ -146,7 +145,7 @@ fn run_headless_loop(
             let header = RtpHeader::new(payload_type, seq, ts, ssrc);
             let packet = RtpPacket { header, payload };
             
-            match socket.try_send_to(&packet.to_bytes(), target) {
+            match socket.send_to(&packet.to_bytes(), target) {
                 Ok(_) => { tx_cnt.fetch_add(1, Ordering::Relaxed); },
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
                 Err(_) => {},
@@ -156,10 +155,8 @@ fn run_headless_loop(
         }
 
         loop {
-            match socket.try_recv_from(&mut recv_buf) {
+            match socket.recv_from(&mut recv_buf) {
                 Ok((len, _)) => {
-                    // [FIX]: IP Filtresi kaldırıldı. UAC (İstemci) NAT arkasındayken, 
-                    // sunucunun Public IP'si değişirse (Load Balancer) paketler reddediliyordu.
                     if len > 12 {
                         rx_cnt.fetch_add(1, Ordering::Relaxed);
                         let payload = &recv_buf[12..len];
@@ -202,28 +199,27 @@ fn run_hardware_loop(
         .map_err(|e| anyhow::anyhow!("Failed to get default input config: {}", e))?;
     let config: cpal::StreamConfig = input_config_raw.clone().into();
     let hw_sample_rate = config.sample_rate.0 as usize;
-    let in_channels = config.channels as usize; // [FIX]: Kanal sayısını al
+    let in_channels = config.channels as usize; 
 
     let output_config_raw = output_device.default_output_config()
         .map_err(|e| anyhow::anyhow!("Failed to get default output config: {}", e))?;
     let output_config: cpal::StreamConfig = output_config_raw.clone().into();
-    let out_channels = output_config.channels as usize; // [FIX]: Kanal sayısını al
+    let out_channels = output_config.channels as usize; 
         
     info!("⚙️ Hardware Audio Config - In: {}Hz {}ch | Out: {}Hz {}ch", 
         hw_sample_rate, in_channels, output_config.sample_rate.0, out_channels);
 
-    let rb_in = HeapRb::<f32>::new(16384);
+    // Buffer'ı 1 saniyelik veri alacak şekilde genişletelim (Güvenlik)
+    let rb_in = HeapRb::<f32>::new(hw_sample_rate * 2);
     let (mut mic_prod, mut mic_cons) = rb_in.split();
-    let rb_out = HeapRb::<f32>::new(16384);
+    let rb_out = HeapRb::<f32>::new(output_config.sample_rate.0 as usize * 2);
     let (mut spk_prod, mut spk_cons) = rb_out.split();
 
     let err_fn = |err| error!("Audio Stream Error: {}", err);
 
-    // [KRİTİK FIX]: Stereo/Mono Çevrimi (Interleaving)
     let input_stream = input_device.build_input_stream(
         &config, 
         move |data: &[f32], _: &_| {
-            // Eger mikrofondan stereo (2 kanal) geliyorsa, sadece ilk kanali al (Mono'ya çevir)
             for frame in data.chunks(in_channels) {
                 let _ = mic_prod.push(frame[0]); 
             }
@@ -235,7 +231,6 @@ fn run_hardware_loop(
     let output_stream = output_device.build_output_stream(
         &output_config, 
         move |data: &mut [f32], _: &_| {
-            // Buffer'dan Mono veriyi al, hoparlör stereo ise her iki kanala da kopyala
             for frame in data.chunks_mut(out_channels) {
                 let sample = spk_cons.pop().unwrap_or(0.0);
                 for s in frame.iter_mut() {
@@ -261,66 +256,77 @@ fn run_hardware_loop(
     let mut seq: u16 = rand::random();
     let mut ts: u32 = rand::random();
     let ssrc: u32 = rand::random();
-    let sample_per_frame = codec_type.samples_per_frame(profile.ptime);
+    let target_8k_samples = codec_type.samples_per_frame(profile.ptime); // G711 için 160
+    
+    // [KRİTİK FIX]: Donanım sample hızına göre 20ms'lik chunk boyutunu hesapla
+    // 44100Hz için 20ms = 882 sample yapar.
+    let hw_frame_size = (hw_sample_rate * profile.ptime as usize) / 1000;
+    
     let mut recv_buf = [0u8; 1500];
 
     // NAT Hole Punching
     for _ in 0..10 {
         if !is_running.load(Ordering::SeqCst) { break; }
-        let silence_frame = vec![0i16; sample_per_frame];
+        let silence_frame = vec![0i16; target_8k_samples];
         let payload = encoder.encode(&silence_frame);
         let header = RtpHeader::new(payload_type, seq, ts, ssrc);
         let packet = RtpPacket { header, payload };
-        let _ = socket.try_send_to(&packet.to_bytes(), target);
+        let _ = socket.send_to(&packet.to_bytes(), target); // std::net
         std::thread::sleep(std::time::Duration::from_millis(20));
         seq = seq.wrapping_add(1);
-        ts = ts.wrapping_add(sample_per_frame as u32);
+        ts = ts.wrapping_add(target_8k_samples as u32);
     }
     info!("🕳️ NAT Hole Punching sequence sent. Media flowing...");
 
     while is_running.load(Ordering::SeqCst) {
         pacer.wait();
 
-        // TX
-        let mut mic_data = Vec::with_capacity(sample_per_frame);
-        while let Some(s) = mic_cons.pop() { 
-            let s_clamped = s.clamp(-1.0, 1.0);
-            mic_data.push((s_clamped * 32767.0) as i16); 
-            // İhtiyacımız olan boyuta ulaştıysak döngüden çık
-            if mic_data.len() >= sample_per_frame { break; }
-        }
+        // --- TX (Mikrofon -> Ağ) ---
+        // Yeterli sample biriktiğinde işlemi yap (örn 44.1kHz'de 882 adet)
+        if mic_cons.len() >= hw_frame_size {
+            let mut mic_data = Vec::with_capacity(hw_frame_size);
+            for _ in 0..hw_frame_size {
+                let s = mic_cons.pop().unwrap_or(0.0);
+                mic_data.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+            }
 
-        if !mic_data.is_empty() {
+            // hw_sample_rate -> 8000Hz. (Çıktı tam 160 sample olmalı)
             let resampled = simple_resample(&mic_data, hw_sample_rate, 8000);
-            for chunk in resampled.chunks(sample_per_frame) {
-                if chunk.len() < sample_per_frame { continue; }
+            
+            // Kodek her chunk için genelde 160 bekler (G.711).
+            for chunk in resampled.chunks(target_8k_samples) {
+                if chunk.len() < target_8k_samples { continue; } // Yetersiz sample varsa atla
+                
                 let payload = encoder.encode(chunk);
                 if payload.is_empty() { continue; }
 
                 let header = RtpHeader::new(payload_type, seq, ts, ssrc);
                 let packet = RtpPacket { header, payload };
                 
-                match socket.try_send_to(&packet.to_bytes(), target) {
+                match socket.send_to(&packet.to_bytes(), target) {
                     Ok(_) => { tx_cnt.fetch_add(1, Ordering::Relaxed); },
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
                     Err(_) => {},
                 }
                 seq = seq.wrapping_add(1);
-                ts = ts.wrapping_add(sample_per_frame as u32);
+                ts = ts.wrapping_add(target_8k_samples as u32);
             }
         }
 
-        // RX
+        // --- RX (Ağ -> Hoparlör) ---
         loop {
-             match socket.try_recv_from(&mut recv_buf) {
+             match socket.recv_from(&mut recv_buf) {
                  Ok((len, _src)) => {
-                     // [KRİTİK FIX]: IP Filtresi kaldırıldı. Sadece veri uzunluğu kontrol ediliyor.
                      if len > 12 {
                          rx_cnt.fetch_add(1, Ordering::Relaxed);
                          let payload = &recv_buf[12..len];
                          let samples_8k = decoder.decode(payload);
-                         let resampled_out = simple_resample(&samples_8k, 8000, hw_sample_rate);
-                         for s in resampled_out { let _ = spk_prod.push(s as f32 / 32768.0); }
+                         
+                         // 8000Hz -> Hoparlör Hz
+                         let resampled_out = simple_resample(&samples_8k, 8000, output_config.sample_rate.0 as usize);
+                         for s in resampled_out { 
+                             let _ = spk_prod.push(s as f32 / 32768.0); 
+                         }
                      }
                  },
                  Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,

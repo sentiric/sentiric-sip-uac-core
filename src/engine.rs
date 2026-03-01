@@ -7,7 +7,7 @@ use sentiric_sip_core::{parser, Header, HeaderName, Method, SipPacket};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
+use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use std::sync::atomic::Ordering;
 use serde_json::json;
@@ -74,12 +74,9 @@ impl SipEngine {
     }
 
     async fn log_step(&self, msg: String, level: &str, call_id: &str) {
-        // UI'a ham metin gönder
         let _ = self.event_tx.send(UacEvent::Log(msg.clone())).await;
 
-        // Observer'a JSON gönder
         let clean_msg = msg.replace("\n", "\\n").replace("\r", "");
-        
         let json_payload = json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "level": level,
@@ -101,13 +98,29 @@ impl SipEngine {
     pub async fn run(&mut self) {
         let local_ip = discover_local_ip();
         
-        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+        // 1. SIP Soketi (Tokio Async)
+        let sip_socket = match TokioUdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => Arc::new(s),
             Err(e) => {
-                let _ = self.event_tx.send(UacEvent::Error(format!("Bind Fail: {}", e))).await;
+                let _ = self.event_tx.send(UacEvent::Error(format!("SIP Bind Fail: {}", e))).await;
                 return;
             }
         };
+
+        // 2. RTP Soketi (Standart Senkron - NonBlocking)
+        let rtp_socket_std = match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => {
+                s.set_nonblocking(true).expect("Failed to set non-blocking on RTP socket");
+                Arc::new(s)
+            },
+            Err(e) => {
+                let _ = self.event_tx.send(UacEvent::Error(format!("RTP Bind Fail: {}", e))).await;
+                return;
+            }
+        };
+
+        let sip_port = sip_socket.local_addr().unwrap().port();
+        let rtp_port = rtp_socket_std.local_addr().unwrap().port();
 
         let mut buf = [0u8; 4096];
 
@@ -125,8 +138,8 @@ impl SipEngine {
         let mut invite_sent_time: Option<std::time::Instant> = None;
         let mut media_active_reported = false;
 
-        // [KRİTİK]: RtpEngine'e event_tx kanalını geçiriyoruz ki doğrudan Flutter UI ile konuşabilsin
-        self.rtp_engine = Some(RtpEngine::new(socket.clone(), self.headless, self.event_tx.clone()));
+        // RTP Motoruna özel ayrılmış std soketini veriyoruz
+        self.rtp_engine = Some(RtpEngine::new(rtp_socket_std.clone(), self.headless, self.event_tx.clone()));
 
         loop {
             tokio::select! {
@@ -147,30 +160,30 @@ impl SipEngine {
                             current_from_tag = format!("tag-{:x}", rand::random::<u16>());
                             current_cseq = 1;
 
-                            let bound_port = socket.local_addr().unwrap().port();
                             let mut invite = SipPacket::new_request(Method::Invite, format!("sip:{}@{}:{}", to_user, target_ip, target_port));
                             let branch = sentiric_sip_core::utils::generate_branch_id();
 
-                            invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", local_ip, bound_port, branch)));
+                            invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", local_ip, sip_port, branch)));
                             invite.headers.push(Header::new(HeaderName::From, format!("<sip:{}@sentiric.mobile>;tag={}", from_user, current_from_tag)));
                             invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}@{}>", to_user, target_ip)));
                             invite.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                             invite.headers.push(Header::new(HeaderName::CSeq, format!("{} INVITE", current_cseq)));
-                            invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", from_user, local_ip, bound_port)));
+                            invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", from_user, local_ip, sip_port)));
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
-                            invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Telecom-SDK/3.2".to_string()));
+                            invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Telecom-SDK/4.0".to_string()));
 
                             let now = chrono::Utc::now().timestamp();
+                            // SDP İÇİNDE RTP PORTUNU BİLDİRİYORUZ
                             let sdp = format!(
                                 "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
-                                now, now, local_ip, local_ip, bound_port
+                                now, now, local_ip, local_ip, rtp_port
                             );
                             invite.body = sdp.as_bytes().to_vec();
 
                             let packet_bytes = invite.to_bytes();
                             self.log_step(format!("📤 SENDING INVITE:\n{}", String::from_utf8_lossy(&packet_bytes)), "INFO", &current_call_id).await;
 
-                            let _ = socket.send_to(&packet_bytes, target_addr).await;
+                            let _ = sip_socket.send_to(&packet_bytes, target_addr).await;
                             last_invite_packet = Some(packet_bytes);
                             invite_sent_time = Some(std::time::Instant::now());
                             retransmit_interval.reset();
@@ -180,8 +193,18 @@ impl SipEngine {
                              last_invite_packet = None;
                              if self.state != CallState::Idle {
                                 if let Some(target) = current_target {
-                                    let bye = SipPacket::new_request(Method::Bye, format!("sip:{}", target));
-                                    let _ = socket.send_to(&bye.to_bytes(), target).await;
+                                    let mut bye = SipPacket::new_request(Method::Bye, format!("sip:{}", target));
+                                    let branch = sentiric_sip_core::utils::generate_branch_id();
+                                    
+                                    bye.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", local_ip, sip_port, branch)));
+                                    bye.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
+                                    bye.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
+                                    bye.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
+                                    
+                                    current_cseq += 1;
+                                    bye.headers.push(Header::new(HeaderName::CSeq, format!("{} BYE", current_cseq)));
+
+                                    let _ = sip_socket.send_to(&bye.to_bytes(), target).await;
                                     self.log_step("📤 BYE Sent".into(), "INFO", &current_call_id).await;
                                 }
                                 if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
@@ -193,7 +216,7 @@ impl SipEngine {
                     }
                 },
 
-                Ok((size, src)) = socket.recv_from(&mut buf) => {
+                Ok((size, src)) = sip_socket.recv_from(&mut buf) => {
                     if size < 4 || (buf[0] & 0x80) != 0 { continue; }
 
                     let raw_in = String::from_utf8_lossy(&buf[..size]).to_string();
@@ -216,15 +239,14 @@ impl SipEngine {
                              
                              let mut ack = SipPacket::new_request(Method::Ack, format!("sip:{}", src));
                              let branch = sentiric_sip_core::utils::generate_branch_id();
-                             let bound_port = socket.local_addr().unwrap().port();
-                             ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", local_ip, bound_port, branch)));
+                             ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", local_ip, sip_port, branch)));
                              ack.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
                              ack.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
                              ack.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                              ack.headers.push(Header::new(HeaderName::CSeq, format!("{} ACK", current_cseq)));
                              
                              if let Some(target) = current_target {
-                                 let _ = socket.send_to(&ack.to_bytes(), target).await;
+                                 let _ = sip_socket.send_to(&ack.to_bytes(), target).await;
                                  self.log_step("--> ACK Sent".into(), "INFO", &current_call_id).await;
                              }
                              self.change_state(CallState::Connected);
@@ -241,7 +263,7 @@ impl SipEngine {
                                     last_invite_packet = None;
                                     self.change_state(CallState::Terminated);
                                 } else {
-                                    let _ = socket.send_to(packet, target).await;
+                                    let _ = sip_socket.send_to(packet, target).await;
                                 }
                             }
                         }
@@ -252,7 +274,7 @@ impl SipEngine {
                     if self.state != CallState::Idle {
                         if let Some(target) = current_target {
                             let keepalive = b"\r\n\r\n";
-                            let _ = socket.send_to(keepalive, target).await;
+                            let _ = sip_socket.send_to(keepalive, target).await;
                         }
                     }
                 },
