@@ -74,14 +74,9 @@ impl RtpEngine {
                 });
                 
                 if let Err(err) = result {
-                    // Panic nesnesini string'e çevirip basmaya çalışalım ki neden çöktüğünü görelim
-                    let msg = if let Some(s) = err.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = err.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "Unknown panic reason".to_string()
-                    };
+                    let msg = if let Some(s) = err.downcast_ref::<&str>() { s.to_string() } 
+                              else if let Some(s) = err.downcast_ref::<String>() { s.clone() } 
+                              else { "Unknown panic reason".to_string() };
                     
                     let _ = ui_tx.blocking_send(UacEvent::Error(format!("☠️ CRITICAL: RTP Thread Panicked! Reason: {}", msg)));
                     is_running.store(false, Ordering::SeqCst);
@@ -163,10 +158,20 @@ fn run_headless_loop(
         loop {
             match socket.try_recv_from(&mut recv_buf) {
                 Ok((len, _)) => {
+                    // [FIX]: IP Filtresi kaldırıldı. UAC (İstemci) NAT arkasındayken, 
+                    // sunucunun Public IP'si değişirse (Load Balancer) paketler reddediliyordu.
                     if len > 12 {
                         rx_cnt.fetch_add(1, Ordering::Relaxed);
                         let payload = &recv_buf[12..len];
-                        let _ = decoder.decode(payload); 
+                        let samples = decoder.decode(payload);
+                        
+                        let mut sum_sq = 0.0;
+                        for s in &samples { sum_sq += *s as f32 * *s as f32; }
+                        let rms = (sum_sq / samples.len() as f32).sqrt();
+
+                        if rms > 100.0 && (seq % 100 == 0) {
+                            debug!("🔊 Headless RX: Signal Detected. RMS: {:.2}", rms);
+                        }
                     }
                 },
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -188,41 +193,55 @@ fn run_hardware_loop(
     let host = cpal::default_host();
     
     let input_device = host.default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("Microphone access denied or not found by Android JNI"))?;
+        .ok_or_else(|| anyhow::anyhow!("Microphone access denied or not found by OS"))?;
     
     let output_device = host.default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("Speaker access denied or not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("Speaker access denied or not found by OS"))?;
 
-    // [FIX]: unwrap() KULLANIMI KALDIRILDI!
-    let input_config = input_device.default_input_config()
+    let input_config_raw = input_device.default_input_config()
         .map_err(|e| anyhow::anyhow!("Failed to get default input config: {}", e))?;
-    let config: cpal::StreamConfig = input_config.into();
+    let config: cpal::StreamConfig = input_config_raw.clone().into();
     let hw_sample_rate = config.sample_rate.0 as usize;
+    let in_channels = config.channels as usize; // [FIX]: Kanal sayısını al
 
-    let rb_in = HeapRb::<f32>::new(8192);
+    let output_config_raw = output_device.default_output_config()
+        .map_err(|e| anyhow::anyhow!("Failed to get default output config: {}", e))?;
+    let output_config: cpal::StreamConfig = output_config_raw.clone().into();
+    let out_channels = output_config.channels as usize; // [FIX]: Kanal sayısını al
+        
+    info!("⚙️ Hardware Audio Config - In: {}Hz {}ch | Out: {}Hz {}ch", 
+        hw_sample_rate, in_channels, output_config.sample_rate.0, out_channels);
+
+    let rb_in = HeapRb::<f32>::new(16384);
     let (mut mic_prod, mut mic_cons) = rb_in.split();
-    let rb_out = HeapRb::<f32>::new(8192);
+    let rb_out = HeapRb::<f32>::new(16384);
     let (mut spk_prod, mut spk_cons) = rb_out.split();
 
     let err_fn = |err| error!("Audio Stream Error: {}", err);
 
+    // [KRİTİK FIX]: Stereo/Mono Çevrimi (Interleaving)
     let input_stream = input_device.build_input_stream(
         &config, 
         move |data: &[f32], _: &_| {
-            for &s in data { let _ = mic_prod.push(s); }
+            // Eger mikrofondan stereo (2 kanal) geliyorsa, sadece ilk kanali al (Mono'ya çevir)
+            for frame in data.chunks(in_channels) {
+                let _ = mic_prod.push(frame[0]); 
+            }
         }, 
         err_fn, 
         None
     ).map_err(|e| anyhow::anyhow!("build_input_stream failed: {}", e))?;
 
-    let output_config_raw = output_device.default_output_config()
-        .map_err(|e| anyhow::anyhow!("Failed to get default output config: {}", e))?;
-    let output_config: cpal::StreamConfig = output_config_raw.into();
-        
     let output_stream = output_device.build_output_stream(
         &output_config, 
         move |data: &mut [f32], _: &_| {
-            for s in data.iter_mut() { *s = spk_cons.pop().unwrap_or(0.0); }
+            // Buffer'dan Mono veriyi al, hoparlör stereo ise her iki kanala da kopyala
+            for frame in data.chunks_mut(out_channels) {
+                let sample = spk_cons.pop().unwrap_or(0.0);
+                for s in frame.iter_mut() {
+                    *s = sample; 
+                }
+            }
         }, 
         err_fn, 
         None
@@ -257,15 +276,18 @@ fn run_hardware_loop(
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(sample_per_frame as u32);
     }
+    info!("🕳️ NAT Hole Punching sequence sent. Media flowing...");
 
     while is_running.load(Ordering::SeqCst) {
         pacer.wait();
 
         // TX
-        let mut mic_data = Vec::with_capacity(sample_per_frame * 2);
+        let mut mic_data = Vec::with_capacity(sample_per_frame);
         while let Some(s) = mic_cons.pop() { 
             let s_clamped = s.clamp(-1.0, 1.0);
             mic_data.push((s_clamped * 32767.0) as i16); 
+            // İhtiyacımız olan boyuta ulaştıysak döngüden çık
+            if mic_data.len() >= sample_per_frame { break; }
         }
 
         if !mic_data.is_empty() {
@@ -291,9 +313,9 @@ fn run_hardware_loop(
         // RX
         loop {
              match socket.try_recv_from(&mut recv_buf) {
-                 Ok((len, src)) => {
-                     // [FIX]: Hedef IP adresi ile eşleşiyor mu kontrolü
-                     if src.ip() == target.ip() && len > 12 {
+                 Ok((len, _src)) => {
+                     // [KRİTİK FIX]: IP Filtresi kaldırıldı. Sadece veri uzunluğu kontrol ediliyor.
+                     if len > 12 {
                          rx_cnt.fetch_add(1, Ordering::Relaxed);
                          let payload = &recv_buf[12..len];
                          let samples_8k = decoder.decode(payload);
