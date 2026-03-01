@@ -195,33 +195,43 @@ fn run_hardware_loop(
     let output_device = host.default_output_device()
         .ok_or_else(|| anyhow::anyhow!("Speaker access denied or not found by OS"))?;
 
-    let input_config_raw = input_device.default_input_config()
-        .map_err(|e| anyhow::anyhow!("Failed to get default input config: {}", e))?;
-    let config: cpal::StreamConfig = input_config_raw.clone().into();
-    let hw_sample_rate = config.sample_rate.0 as usize;
-    let in_channels = config.channels as usize; 
+    // [FIX]: Android VoIP modunda (MODE_IN_COMMUNICATION) Mono (1 kanal) zorunludur.
+    // Varsayılan config yerine, 1 kanallı uyumlu bir config arıyoruz.
+    let supported_input_configs = input_device.supported_input_configs()?;
+    let input_config_range = supported_input_configs
+        .filter(|c| c.channels() == 1) // Sadece Mono destekleyenleri al
+        .max_by(|a, b| a.max_sample_rate().cmp(&b.max_sample_rate())) // En yüksek kaliteyi seç
+        .ok_or_else(|| anyhow::anyhow!("No supported MONO input config found"))?;
 
-    let output_config_raw = output_device.default_output_config()
-        .map_err(|e| anyhow::anyhow!("Failed to get default output config: {}", e))?;
-    let output_config: cpal::StreamConfig = output_config_raw.clone().into();
-    let out_channels = output_config.channels as usize; 
-        
-    info!("⚙️ Hardware Audio Config - In: {}Hz {}ch | Out: {}Hz {}ch", 
-        hw_sample_rate, in_channels, output_config.sample_rate.0, out_channels);
+    let input_config: cpal::StreamConfig = input_config_range.with_max_sample_rate().into();
 
-    // Buffer'ı 1 saniyelik veri alacak şekilde genişletelim (Güvenlik)
-    let rb_in = HeapRb::<f32>::new(hw_sample_rate * 2);
+    let supported_output_configs = output_device.supported_output_configs()?;
+    let output_config_range = supported_output_configs
+        .filter(|c| c.channels() == 1) // Sadece Mono
+        .max_by(|a, b| a.max_sample_rate().cmp(&b.max_sample_rate()))
+        .ok_or_else(|| anyhow::anyhow!("No supported MONO output config found"))?;
+
+    let output_config: cpal::StreamConfig = output_config_range.with_max_sample_rate().into();
+
+    let hw_sample_rate_in = input_config.sample_rate.0 as usize;
+    let hw_sample_rate_out = output_config.sample_rate.0 as usize;
+    
+    info!("⚙️ Hardware Audio Config [FORCED MONO] - In: {}Hz | Out: {}Hz", 
+        hw_sample_rate_in, hw_sample_rate_out);
+
+    let rb_in = HeapRb::<f32>::new(hw_sample_rate_in * 2);
     let (mut mic_prod, mut mic_cons) = rb_in.split();
-    let rb_out = HeapRb::<f32>::new(output_config.sample_rate.0 as usize * 2);
+    let rb_out = HeapRb::<f32>::new(hw_sample_rate_out * 2);
     let (mut spk_prod, mut spk_cons) = rb_out.split();
 
     let err_fn = |err| error!("Audio Stream Error: {}", err);
 
     let input_stream = input_device.build_input_stream(
-        &config, 
+        &input_config, 
         move |data: &[f32], _: &_| {
-            for frame in data.chunks(in_channels) {
-                let _ = mic_prod.push(frame[0]); 
+            // Veri zaten Mono geliyor, direkt bas.
+            for &sample in data {
+                let _ = mic_prod.push(sample); 
             }
         }, 
         err_fn, 
@@ -231,11 +241,8 @@ fn run_hardware_loop(
     let output_stream = output_device.build_output_stream(
         &output_config, 
         move |data: &mut [f32], _: &_| {
-            for frame in data.chunks_mut(out_channels) {
-                let sample = spk_cons.pop().unwrap_or(0.0);
-                for s in frame.iter_mut() {
-                    *s = sample; 
-                }
+            for sample in data.iter_mut() {
+                *sample = spk_cons.pop().unwrap_or(0.0);
             }
         }, 
         err_fn, 
@@ -256,11 +263,10 @@ fn run_hardware_loop(
     let mut seq: u16 = rand::random();
     let mut ts: u32 = rand::random();
     let ssrc: u32 = rand::random();
-    let target_8k_samples = codec_type.samples_per_frame(profile.ptime); // G711 için 160
+    let target_8k_samples = codec_type.samples_per_frame(profile.ptime);
     
-    // [KRİTİK FIX]: Donanım sample hızına göre 20ms'lik chunk boyutunu hesapla
-    // 44100Hz için 20ms = 882 sample yapar.
-    let hw_frame_size = (hw_sample_rate * profile.ptime as usize) / 1000;
+    // Chunk boyutu hesaplama (Mono olduğu için channel çarpanı yok)
+    let hw_frame_size = (hw_sample_rate_in * profile.ptime as usize) / 1000;
     
     let mut recv_buf = [0u8; 1500];
 
@@ -271,7 +277,7 @@ fn run_hardware_loop(
         let payload = encoder.encode(&silence_frame);
         let header = RtpHeader::new(payload_type, seq, ts, ssrc);
         let packet = RtpPacket { header, payload };
-        let _ = socket.send_to(&packet.to_bytes(), target); // std::net
+        let _ = socket.send_to(&packet.to_bytes(), target);
         std::thread::sleep(std::time::Duration::from_millis(20));
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(target_8k_samples as u32);
@@ -282,7 +288,6 @@ fn run_hardware_loop(
         pacer.wait();
 
         // --- TX (Mikrofon -> Ağ) ---
-        // Yeterli sample biriktiğinde işlemi yap (örn 44.1kHz'de 882 adet)
         if mic_cons.len() >= hw_frame_size {
             let mut mic_data = Vec::with_capacity(hw_frame_size);
             for _ in 0..hw_frame_size {
@@ -290,12 +295,10 @@ fn run_hardware_loop(
                 mic_data.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
             }
 
-            // hw_sample_rate -> 8000Hz. (Çıktı tam 160 sample olmalı)
-            let resampled = simple_resample(&mic_data, hw_sample_rate, 8000);
+            let resampled = simple_resample(&mic_data, hw_sample_rate_in, 8000);
             
-            // Kodek her chunk için genelde 160 bekler (G.711).
             for chunk in resampled.chunks(target_8k_samples) {
-                if chunk.len() < target_8k_samples { continue; } // Yetersiz sample varsa atla
+                if chunk.len() < target_8k_samples { continue; }
                 
                 let payload = encoder.encode(chunk);
                 if payload.is_empty() { continue; }
@@ -322,8 +325,7 @@ fn run_hardware_loop(
                          let payload = &recv_buf[12..len];
                          let samples_8k = decoder.decode(payload);
                          
-                         // 8000Hz -> Hoparlör Hz
-                         let resampled_out = simple_resample(&samples_8k, 8000, output_config.sample_rate.0 as usize);
+                         let resampled_out = simple_resample(&samples_8k, 8000, hw_sample_rate_out);
                          for s in resampled_out { 
                              let _ = spk_prod.push(s as f32 / 32768.0); 
                          }
