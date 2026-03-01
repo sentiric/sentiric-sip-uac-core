@@ -5,12 +5,12 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use ringbuf::HeapRb;
-use tracing::{info, error};
+use tracing::{info, error, warn, debug};
 use sentiric_rtp_core::{AudioProfile, CodecFactory, Pacer, RtpHeader, RtpPacket, simple_resample};
 use std::panic;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::sync::mpsc;
-use crate::UacEvent; // UI Olayları
+use crate::UacEvent; 
 
 pub struct RtpEngine {
     socket: Arc<UdpSocket>,
@@ -18,7 +18,7 @@ pub struct RtpEngine {
     pub rx_count: Arc<AtomicU64>,
     pub tx_count: Arc<AtomicU64>,
     headless_mode: bool,
-    event_tx: mpsc::Sender<UacEvent>, // Flutter UI Kanalı
+    event_tx: mpsc::Sender<UacEvent>,
 }
 
 impl RtpEngine {
@@ -60,14 +60,11 @@ impl RtpEngine {
                     } else {
                         let _ = ui_tx_inner.blocking_send(UacEvent::Log("🎤 Connecting to Hardware Mic/Speaker...".into()));
                         
-                        // [KRİTİK AUTO-FALLBACK MİMARİSİ]
                         if let Err(e) = run_hardware_loop(is_running_inner.clone(), socket.clone(), target, rx_cnt.clone(), tx_cnt.clone()) {
                             
-                            // Donanım hatası oluştu, UI'a bildir ve hemen Sanal Sese geç!
                             let err_msg = format!("⚠️ Hardware Audio Failed: {}. FALLING BACK TO VIRTUAL AUDIO!", e);
                             let _ = ui_tx_inner.blocking_send(UacEvent::Log(err_msg));
                             
-                            // Network testinin (Echo) devam etmesi için sanal sesi başlat
                             if let Err(fallback_err) = run_headless_loop(is_running_inner.clone(), socket, target, rx_cnt, tx_cnt) {
                                 let _ = ui_tx_inner.blocking_send(UacEvent::Error(format!("Fallback also failed: {}", fallback_err)));
                             }
@@ -76,8 +73,17 @@ impl RtpEngine {
                     is_running_inner.store(false, Ordering::SeqCst);
                 });
                 
-                if let Err(_) = result {
-                    let _ = ui_tx.blocking_send(UacEvent::Error("☠️ CRITICAL: RTP Thread Panicked!".into()));
+                if let Err(err) = result {
+                    // Panic nesnesini string'e çevirip basmaya çalışalım ki neden çöktüğünü görelim
+                    let msg = if let Some(s) = err.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = err.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Unknown panic reason".to_string()
+                    };
+                    
+                    let _ = ui_tx.blocking_send(UacEvent::Error(format!("☠️ CRITICAL: RTP Thread Panicked! Reason: {}", msg)));
                     is_running.store(false, Ordering::SeqCst);
                 }
             })
@@ -160,7 +166,7 @@ fn run_headless_loop(
                     if len > 12 {
                         rx_cnt.fetch_add(1, Ordering::Relaxed);
                         let payload = &recv_buf[12..len];
-                        let _ = decoder.decode(payload); // Just decode to ensure validity
+                        let _ = decoder.decode(payload); 
                     }
                 },
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -181,14 +187,16 @@ fn run_hardware_loop(
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
     
-    // Güvenli Cihaz Arama
     let input_device = host.default_input_device()
         .ok_or_else(|| anyhow::anyhow!("Microphone access denied or not found by Android JNI"))?;
     
     let output_device = host.default_output_device()
         .ok_or_else(|| anyhow::anyhow!("Speaker access denied or not found"))?;
 
-    let config: cpal::StreamConfig = input_device.default_input_config()?.into();
+    // [FIX]: unwrap() KULLANIMI KALDIRILDI!
+    let input_config = input_device.default_input_config()
+        .map_err(|e| anyhow::anyhow!("Failed to get default input config: {}", e))?;
+    let config: cpal::StreamConfig = input_config.into();
     let hw_sample_rate = config.sample_rate.0 as usize;
 
     let rb_in = HeapRb::<f32>::new(8192);
@@ -205,9 +213,12 @@ fn run_hardware_loop(
         }, 
         err_fn, 
         None
-    )?;
+    ).map_err(|e| anyhow::anyhow!("build_input_stream failed: {}", e))?;
 
-    let output_config: cpal::StreamConfig = output_device.default_output_config()?.into();
+    let output_config_raw = output_device.default_output_config()
+        .map_err(|e| anyhow::anyhow!("Failed to get default output config: {}", e))?;
+    let output_config: cpal::StreamConfig = output_config_raw.into();
+        
     let output_stream = output_device.build_output_stream(
         &output_config, 
         move |data: &mut [f32], _: &_| {
@@ -215,10 +226,10 @@ fn run_hardware_loop(
         }, 
         err_fn, 
         None
-    )?;
+    ).map_err(|e| anyhow::anyhow!("build_output_stream failed: {}", e))?;
 
-    input_stream.play()?;
-    output_stream.play()?;
+    input_stream.play().map_err(|e| anyhow::anyhow!("input_stream.play() failed: {}", e))?;
+    output_stream.play().map_err(|e| anyhow::anyhow!("output_stream.play() failed: {}", e))?;
     
     let profile = AudioProfile::default();
     let codec_type = profile.preferred_audio_codec();
@@ -281,6 +292,7 @@ fn run_hardware_loop(
         loop {
              match socket.try_recv_from(&mut recv_buf) {
                  Ok((len, src)) => {
+                     // [FIX]: Hedef IP adresi ile eşleşiyor mu kontrolü
                      if src.ip() == target.ip() && len > 12 {
                          rx_cnt.fetch_add(1, Ordering::Relaxed);
                          let payload = &recv_buf[12..len];
