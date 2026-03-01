@@ -49,12 +49,13 @@ pub struct TelecomClient {
 
 impl TelecomClient {
     /// Yeni bir istemci oluşturur ve motoru (Engine) arka planda başlatır.
-    pub fn new(event_tx: mpsc::Sender<UacEvent>) -> Self {
+    /// headless: true ise ses kartı yerine sanal DSP kullanılır.
+    pub fn new(event_tx: mpsc::Sender<UacEvent>, headless: bool) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         
         // SipEngine'i başlat
         tokio::spawn(async move {
-            let mut engine = engine::SipEngine::new(event_tx, cmd_rx).await;
+            let mut engine = engine::SipEngine::new(event_tx, cmd_rx, headless).await;
             engine.run().await;
         });
 

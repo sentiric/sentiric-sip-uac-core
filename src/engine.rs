@@ -10,7 +10,8 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use std::sync::atomic::Ordering;
-use serde_json::json; // Cargo.toml'a serde_json eklenmeli
+use serde_json::json;
+
 // Telemetry Module
 pub mod observer_proto {
     tonic::include_proto!("sentiric.observer.v1");
@@ -25,12 +26,14 @@ pub struct SipEngine {
     state: CallState,
     telemetry_tx: mpsc::Sender<IngestLogRequest>,
     observer_client: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>,
+    headless: bool, // YENİ
 }
 
 impl SipEngine {
     pub async fn new(
         event_tx: mpsc::Sender<UacEvent>,
         command_rx: mpsc::Receiver<ClientCommand>,
+        headless: bool, // YENİ
     ) -> Self {
         let (tel_tx, tel_rx) = mpsc::channel::<IngestLogRequest>(500);
         let observer_client = Arc::new(Mutex::new(None));
@@ -44,6 +47,7 @@ impl SipEngine {
             state: CallState::Idle,
             telemetry_tx: tel_tx,
             observer_client,
+            headless, // SET
         }
     }
 
@@ -52,7 +56,7 @@ impl SipEngine {
         client_container: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>
     ) {
         tokio::spawn(async move {
-            tracing::info!("📡 Telemetry background worker ready.");
+            // tracing::info!("📡 Telemetry background worker ready.");
             while let Some(req) = rx.recv().await {
                 let mut guard = client_container.lock().await;
                 if let Some(client) = guard.as_mut() {
@@ -71,11 +75,8 @@ impl SipEngine {
     }
 
     async fn log_step(&self, msg: String, level: &str, call_id: &str) {
-        // UI'a ham metin gönder (Okunabilirlik için)
         let _ = self.event_tx.send(UacEvent::Log(msg.clone())).await;
 
-        // Observer'a JSON gönder (Analitik için)
-        // Log mesajındaki satır sonlarını kaçış karakteriyle düzeltiyoruz
         let clean_msg = msg.replace("\n", "\\n").replace("\r", "");
         
         let json_payload = json!({
@@ -88,7 +89,7 @@ impl SipEngine {
 
         let req = IngestLogRequest {
             service_name: "MOBILE-SDK".into(),
-            message: json_payload, // JSON string olarak gönder
+            message: json_payload,
             level: level.into(),
             trace_id: call_id.into(),
             node_id: "SDK-CLIENT".into(), 
@@ -106,7 +107,8 @@ impl SipEngine {
             }
         };
 
-        self.rtp_engine = Some(RtpEngine::new(socket.clone()));
+        // RtpEngine başlatılırken Headless flag'ini geçir
+        self.rtp_engine = Some(RtpEngine::new(socket.clone(), self.headless));
         let mut buf = [0u8; 4096];
 
         let mut current_target: Option<SocketAddr> = None;
@@ -151,7 +153,7 @@ impl SipEngine {
                             invite.headers.push(Header::new(HeaderName::CSeq, format!("{} INVITE", current_cseq)));
                             invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", from_user, local_ip, bound_port)));
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
-                            invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Telecom-SDK/2.5".to_string()));
+                            invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Telecom-SDK/3.0".to_string()));
 
                             let now = chrono::Utc::now().timestamp();
                             let sdp = format!(
