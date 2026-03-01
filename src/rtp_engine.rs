@@ -5,10 +5,12 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use ringbuf::HeapRb;
-use tracing::{info, error, warn, debug};
+use tracing::{info, error};
 use sentiric_rtp_core::{AudioProfile, CodecFactory, Pacer, RtpHeader, RtpPacket, simple_resample};
 use std::panic;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use tokio::sync::mpsc;
+use crate::UacEvent; // UI Olayları
 
 pub struct RtpEngine {
     socket: Arc<UdpSocket>,
@@ -16,16 +18,18 @@ pub struct RtpEngine {
     pub rx_count: Arc<AtomicU64>,
     pub tx_count: Arc<AtomicU64>,
     headless_mode: bool,
+    event_tx: mpsc::Sender<UacEvent>, // Flutter UI Kanalı
 }
 
 impl RtpEngine {
-    pub fn new(socket: Arc<UdpSocket>, headless: bool) -> Self {
+    pub fn new(socket: Arc<UdpSocket>, headless: bool, event_tx: mpsc::Sender<UacEvent>) -> Self {
         Self {
             socket,
             is_running: Arc::new(AtomicBool::new(false)),
             rx_count: Arc::new(AtomicU64::new(0)),
             tx_count: Arc::new(AtomicU64::new(0)),
             headless_mode: headless,
+            event_tx,
         }
     }
 
@@ -39,28 +43,41 @@ impl RtpEngine {
         let rx_cnt = self.rx_count.clone();
         let tx_cnt = self.tx_count.clone();
         let headless = self.headless_mode;
+        let ui_tx = self.event_tx.clone();
 
         std::thread::Builder::new()
             .name("rtp-worker".to_string())
             .spawn(move || {
                 let is_running_inner = is_running.clone();
+                let ui_tx_inner = ui_tx.clone();
+                
                 let result = panic::catch_unwind(move || {
                     if headless {
-                        info!("👻 Starting HEADLESS Audio Loop (Virtual DSP)");
+                        let _ = ui_tx_inner.blocking_send(UacEvent::Log("👻 Booting Virtual DSP (Headless)".into()));
                         if let Err(e) = run_headless_loop(is_running_inner.clone(), socket, target, rx_cnt, tx_cnt) {
-                            error!("Headless Loop Error: {:?}", e);
+                            let _ = ui_tx_inner.blocking_send(UacEvent::Error(format!("Virtual DSP Error: {}", e)));
                         }
                     } else {
-                        info!("🎤 Starting HARDWARE Audio Loop (CPAL)");
-                        if let Err(e) = run_hardware_loop(is_running_inner.clone(), socket, target, rx_cnt, tx_cnt) {
-                            error!("🚨 Hardware Loop Fatal Error: {:?}", e);
+                        let _ = ui_tx_inner.blocking_send(UacEvent::Log("🎤 Connecting to Hardware Mic/Speaker...".into()));
+                        
+                        // [KRİTİK AUTO-FALLBACK MİMARİSİ]
+                        if let Err(e) = run_hardware_loop(is_running_inner.clone(), socket.clone(), target, rx_cnt.clone(), tx_cnt.clone()) {
+                            
+                            // Donanım hatası oluştu, UI'a bildir ve hemen Sanal Sese geç!
+                            let err_msg = format!("⚠️ Hardware Audio Failed: {}. FALLING BACK TO VIRTUAL AUDIO!", e);
+                            let _ = ui_tx_inner.blocking_send(UacEvent::Log(err_msg));
+                            
+                            // Network testinin (Echo) devam etmesi için sanal sesi başlat
+                            if let Err(fallback_err) = run_headless_loop(is_running_inner.clone(), socket, target, rx_cnt, tx_cnt) {
+                                let _ = ui_tx_inner.blocking_send(UacEvent::Error(format!("Fallback also failed: {}", fallback_err)));
+                            }
                         }
                     }
                     is_running_inner.store(false, Ordering::SeqCst);
                 });
                 
-                if let Err(err) = result {
-                    error!("☠️ RTP Thread Panic Caught! Prevented app crash: {:?}", err);
+                if let Err(_) = result {
+                    let _ = ui_tx.blocking_send(UacEvent::Error("☠️ CRITICAL: RTP Thread Panicked!".into()));
                     is_running.store(false, Ordering::SeqCst);
                 }
             })
@@ -111,7 +128,6 @@ fn run_headless_loop(
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(sample_per_frame as u32);
     }
-    info!("🕳️ NAT Hole Punching sequence sent (Headless).");
 
     while is_running.load(Ordering::SeqCst) {
         pacer.wait();
@@ -132,7 +148,7 @@ fn run_headless_loop(
             match socket.try_send_to(&packet.to_bytes(), target) {
                 Ok(_) => { tx_cnt.fetch_add(1, Ordering::Relaxed); },
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
-                Err(e) => error!("Headless TX Error: {}", e),
+                Err(_) => {},
             }
             seq = seq.wrapping_add(1);
             ts = ts.wrapping_add(sample_per_frame as u32);
@@ -144,15 +160,7 @@ fn run_headless_loop(
                     if len > 12 {
                         rx_cnt.fetch_add(1, Ordering::Relaxed);
                         let payload = &recv_buf[12..len];
-                        let samples = decoder.decode(payload);
-                        
-                        let mut sum_sq = 0.0;
-                        for s in &samples { sum_sq += *s as f32 * *s as f32; }
-                        let rms = (sum_sq / samples.len() as f32).sqrt();
-
-                        if rms > 100.0 && (seq % 100 == 0) {
-                            debug!("🔊 Headless RX: Signal Detected. RMS: {:.2}", rms);
-                        }
+                        let _ = decoder.decode(payload); // Just decode to ensure validity
                     }
                 },
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -163,7 +171,7 @@ fn run_headless_loop(
     Ok(())
 }
 
-// --- DONANIM (HARDWARE) LOOP (Güçlendirilmiş) ---
+// --- DONANIM (HARDWARE) LOOP ---
 fn run_hardware_loop(
     is_running: Arc<AtomicBool>, 
     socket: Arc<UdpSocket>, 
@@ -171,42 +179,25 @@ fn run_hardware_loop(
     rx_cnt: Arc<AtomicU64>,
     tx_cnt: Arc<AtomicU64>
 ) -> anyhow::Result<()> {
-    info!("🔍 Initializing audio hardware...");
-
     let host = cpal::default_host();
     
-    // [DEFENSIVE]: Cihazları bulamazsa paniklemek yerine zarifçe dön.
-    let input_device = match host.default_input_device() {
-        Some(d) => d,
-        None => return Err(anyhow::anyhow!("Microphone not found or permission denied by OS.")),
-    };
+    // Güvenli Cihaz Arama
+    let input_device = host.default_input_device()
+        .ok_or_else(|| anyhow::anyhow!("Microphone access denied or not found by Android JNI"))?;
     
-    let output_device = match host.default_output_device() {
-        Some(d) => d,
-        None => return Err(anyhow::anyhow!("Speaker not found.")),
-    };
+    let output_device = host.default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("Speaker access denied or not found"))?;
 
-    info!("🎤 Input: {}", input_device.name().unwrap_or("Unknown".into()));
-    info!("🔊 Output: {}", output_device.name().unwrap_or("Unknown".into()));
-
-    // [DEFENSIVE]: Config çekerken hata olursa yakala
-    let input_config_result = input_device.default_input_config();
-    if input_config_result.is_err() {
-        return Err(anyhow::anyhow!("Failed to get default input config. Device might be locked."));
-    }
-    let config: cpal::StreamConfig = input_config_result.unwrap().into();
+    let config: cpal::StreamConfig = input_device.default_input_config()?.into();
     let hw_sample_rate = config.sample_rate.0 as usize;
-    
-    info!("⚙️ Hardware Sample Rate: {}Hz", hw_sample_rate);
 
     let rb_in = HeapRb::<f32>::new(8192);
     let (mut mic_prod, mut mic_cons) = rb_in.split();
     let rb_out = HeapRb::<f32>::new(8192);
     let (mut spk_prod, mut spk_cons) = rb_out.split();
 
-    let err_fn = |err| error!("CPAL Stream Error: {}", err);
+    let err_fn = |err| error!("Audio Stream Error: {}", err);
 
-    info!("🛠️ Building Input Stream...");
     let input_stream = input_device.build_input_stream(
         &config, 
         move |data: &[f32], _: &_| {
@@ -214,13 +205,9 @@ fn run_hardware_loop(
         }, 
         err_fn, 
         None
-    ).map_err(|e| anyhow::anyhow!("build_input_stream failed: {}", e))?;
+    )?;
 
-    info!("🛠️ Building Output Stream...");
-    let output_config: cpal::StreamConfig = output_device.default_output_config()
-        .map_err(|e| anyhow::anyhow!("Failed to get default output config: {}", e))?
-        .into();
-        
+    let output_config: cpal::StreamConfig = output_device.default_output_config()?.into();
     let output_stream = output_device.build_output_stream(
         &output_config, 
         move |data: &mut [f32], _: &_| {
@@ -228,11 +215,10 @@ fn run_hardware_loop(
         }, 
         err_fn, 
         None
-    ).map_err(|e| anyhow::anyhow!("build_output_stream failed: {}", e))?;
+    )?;
 
-    info!("▶️ Starting Audio Streams...");
-    input_stream.play().map_err(|e| anyhow::anyhow!("input_stream.play() failed: {}", e))?;
-    output_stream.play().map_err(|e| anyhow::anyhow!("output_stream.play() failed: {}", e))?;
+    input_stream.play()?;
+    output_stream.play()?;
     
     let profile = AudioProfile::default();
     let codec_type = profile.preferred_audio_codec();
@@ -260,7 +246,6 @@ fn run_hardware_loop(
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(sample_per_frame as u32);
     }
-    info!("🕳️ NAT Hole Punching sequence sent (Hardware). Media flowing...");
 
     while is_running.load(Ordering::SeqCst) {
         pacer.wait();
@@ -285,7 +270,7 @@ fn run_hardware_loop(
                 match socket.try_send_to(&packet.to_bytes(), target) {
                     Ok(_) => { tx_cnt.fetch_add(1, Ordering::Relaxed); },
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
-                    Err(e) => error!("RTP Send Error: {}", e),
+                    Err(_) => {},
                 }
                 seq = seq.wrapping_add(1);
                 ts = ts.wrapping_add(sample_per_frame as u32);
@@ -310,6 +295,5 @@ fn run_hardware_loop(
         }
     }
     
-    info!("🛑 Hardware Audio Loop Stopped cleanly.");
     Ok(())
 }
