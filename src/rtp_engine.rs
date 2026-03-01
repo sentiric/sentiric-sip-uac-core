@@ -5,10 +5,9 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use ringbuf::HeapRb;
-use tracing::{info, error, debug};
+use tracing::{info, error, warn, debug};
 use sentiric_rtp_core::{AudioProfile, CodecFactory, Pacer, RtpHeader, RtpPacket, simple_resample};
 use std::panic;
-// CPAL (Ses Kartı) sadece Hardware modunda kullanılacak
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 pub struct RtpEngine {
@@ -54,14 +53,14 @@ impl RtpEngine {
                     } else {
                         info!("🎤 Starting HARDWARE Audio Loop (CPAL)");
                         if let Err(e) = run_hardware_loop(is_running_inner.clone(), socket, target, rx_cnt, tx_cnt) {
-                            error!("Hardware Loop Error: {:?}", e);
+                            error!("🚨 Hardware Loop Fatal Error: {:?}", e);
                         }
                     }
                     is_running_inner.store(false, Ordering::SeqCst);
                 });
                 
                 if let Err(err) = result {
-                    error!("RTP Thread Panic: {:?}", err);
+                    error!("☠️ RTP Thread Panic Caught! Prevented app crash: {:?}", err);
                     is_running.store(false, Ordering::SeqCst);
                 }
             })
@@ -95,23 +94,19 @@ fn run_headless_loop(
     let sample_per_frame = codec_type.samples_per_frame(profile.ptime);
     let mut recv_buf = [0u8; 1500];
 
-    // [FIX]: Türü açıkça f32 olarak belirttik
     let mut phase: f32 = 0.0;
     let freq = 1000.0;
     let sample_rate = 8000.0;
     let step = freq * 2.0 * std::f32::consts::PI / sample_rate;
     
-    // [YENİ]: NAT Hole Punching (Başlangıçta Sessizlik Gönder)
-    // Bu işlem, sunucunun bize veri gönderebilmesi için NAT tablosunda bir giriş açar.
+    // NAT Hole Punching
     for _ in 0..10 {
         if !is_running.load(Ordering::SeqCst) { break; }
-        
         let silence_frame = vec![0i16; sample_per_frame];
         let payload = encoder.encode(&silence_frame);
         let header = RtpHeader::new(payload_type, seq, ts, ssrc);
         let packet = RtpPacket { header, payload };
         let _ = socket.try_send_to(&packet.to_bytes(), target);
-        
         std::thread::sleep(std::time::Duration::from_millis(20));
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(sample_per_frame as u32);
@@ -121,7 +116,6 @@ fn run_headless_loop(
     while is_running.load(Ordering::SeqCst) {
         pacer.wait();
 
-        // 1. Sanal Mikrofon
         let mut pcm_frame = Vec::with_capacity(sample_per_frame);
         for _ in 0..sample_per_frame {
             let val = (phase.sin() * 20000.0) as i16;
@@ -130,7 +124,6 @@ fn run_headless_loop(
             if phase > 2.0 * std::f32::consts::PI { phase -= 2.0 * std::f32::consts::PI; }
         }
 
-        // 2. Encode & Send
         let payload = encoder.encode(&pcm_frame);
         if !payload.is_empty() {
             let header = RtpHeader::new(payload_type, seq, ts, ssrc);
@@ -145,18 +138,15 @@ fn run_headless_loop(
             ts = ts.wrapping_add(sample_per_frame as u32);
         }
 
-        // 3. Receive & Analyze
         loop {
             match socket.try_recv_from(&mut recv_buf) {
                 Ok((len, _)) => {
                     if len > 12 {
                         rx_cnt.fetch_add(1, Ordering::Relaxed);
-                        // Decode edip ses var mı kontrol et (RMS)
                         let payload = &recv_buf[12..len];
                         let samples = decoder.decode(payload);
                         
                         let mut sum_sq = 0.0;
-                        // [FIX]: Gereksiz parantez kaldırıldı
                         for s in &samples { sum_sq += *s as f32 * *s as f32; }
                         let rms = (sum_sq / samples.len() as f32).sqrt();
 
@@ -173,7 +163,7 @@ fn run_headless_loop(
     Ok(())
 }
 
-// --- DONANIM (HARDWARE) LOOP ---
+// --- DONANIM (HARDWARE) LOOP (Güçlendirilmiş) ---
 fn run_hardware_loop(
     is_running: Arc<AtomicBool>, 
     socket: Arc<UdpSocket>, 
@@ -181,25 +171,42 @@ fn run_hardware_loop(
     rx_cnt: Arc<AtomicU64>,
     tx_cnt: Arc<AtomicU64>
 ) -> anyhow::Result<()> {
+    info!("🔍 Initializing audio hardware...");
+
     let host = cpal::default_host();
-    let input_device = host.default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("No Default Input Device Found"))?;
-    let output_device = host.default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("No Default Output Device Found"))?;
+    
+    // [DEFENSIVE]: Cihazları bulamazsa paniklemek yerine zarifçe dön.
+    let input_device = match host.default_input_device() {
+        Some(d) => d,
+        None => return Err(anyhow::anyhow!("Microphone not found or permission denied by OS.")),
+    };
+    
+    let output_device = match host.default_output_device() {
+        Some(d) => d,
+        None => return Err(anyhow::anyhow!("Speaker not found.")),
+    };
 
     info!("🎤 Input: {}", input_device.name().unwrap_or("Unknown".into()));
     info!("🔊 Output: {}", output_device.name().unwrap_or("Unknown".into()));
 
-    let config: cpal::StreamConfig = input_device.default_input_config()?.into();
+    // [DEFENSIVE]: Config çekerken hata olursa yakala
+    let input_config_result = input_device.default_input_config();
+    if input_config_result.is_err() {
+        return Err(anyhow::anyhow!("Failed to get default input config. Device might be locked."));
+    }
+    let config: cpal::StreamConfig = input_config_result.unwrap().into();
     let hw_sample_rate = config.sample_rate.0 as usize;
+    
+    info!("⚙️ Hardware Sample Rate: {}Hz", hw_sample_rate);
 
     let rb_in = HeapRb::<f32>::new(8192);
     let (mut mic_prod, mut mic_cons) = rb_in.split();
     let rb_out = HeapRb::<f32>::new(8192);
     let (mut spk_prod, mut spk_cons) = rb_out.split();
 
-    let err_fn = |err| error!("Audio Stream Callback Error: {}", err);
+    let err_fn = |err| error!("CPAL Stream Error: {}", err);
 
+    info!("🛠️ Building Input Stream...");
     let input_stream = input_device.build_input_stream(
         &config, 
         move |data: &[f32], _: &_| {
@@ -207,9 +214,13 @@ fn run_hardware_loop(
         }, 
         err_fn, 
         None
-    )?;
+    ).map_err(|e| anyhow::anyhow!("build_input_stream failed: {}", e))?;
 
-    let output_config: cpal::StreamConfig = output_device.default_output_config()?.into();
+    info!("🛠️ Building Output Stream...");
+    let output_config: cpal::StreamConfig = output_device.default_output_config()
+        .map_err(|e| anyhow::anyhow!("Failed to get default output config: {}", e))?
+        .into();
+        
     let output_stream = output_device.build_output_stream(
         &output_config, 
         move |data: &mut [f32], _: &_| {
@@ -217,12 +228,12 @@ fn run_hardware_loop(
         }, 
         err_fn, 
         None
-    )?;
+    ).map_err(|e| anyhow::anyhow!("build_output_stream failed: {}", e))?;
 
-    input_stream.play()?;
-    output_stream.play()?;
+    info!("▶️ Starting Audio Streams...");
+    input_stream.play().map_err(|e| anyhow::anyhow!("input_stream.play() failed: {}", e))?;
+    output_stream.play().map_err(|e| anyhow::anyhow!("output_stream.play() failed: {}", e))?;
     
-    // DSP & Codec Loop
     let profile = AudioProfile::default();
     let codec_type = profile.preferred_audio_codec();
     let payload_type = profile.get_by_payload(codec_type as u8).map(|c| c.payload_type).unwrap_or(0);
@@ -237,7 +248,7 @@ fn run_hardware_loop(
     let sample_per_frame = codec_type.samples_per_frame(profile.ptime);
     let mut recv_buf = [0u8; 1500];
 
-    // [YENİ]: NAT Hole Punching (Hardware Mode)
+    // NAT Hole Punching
     for _ in 0..10 {
         if !is_running.load(Ordering::SeqCst) { break; }
         let silence_frame = vec![0i16; sample_per_frame];
@@ -246,11 +257,10 @@ fn run_hardware_loop(
         let packet = RtpPacket { header, payload };
         let _ = socket.try_send_to(&packet.to_bytes(), target);
         std::thread::sleep(std::time::Duration::from_millis(20));
-        
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(sample_per_frame as u32);
     }
-    info!("🕳️ NAT Hole Punching sequence sent (Hardware).");
+    info!("🕳️ NAT Hole Punching sequence sent (Hardware). Media flowing...");
 
     while is_running.load(Ordering::SeqCst) {
         pacer.wait();
@@ -300,5 +310,6 @@ fn run_hardware_loop(
         }
     }
     
+    info!("🛑 Hardware Audio Loop Stopped cleanly.");
     Ok(())
 }
