@@ -26,14 +26,14 @@ pub struct SipEngine {
     state: CallState,
     telemetry_tx: mpsc::Sender<IngestLogRequest>,
     observer_client: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>,
-    headless: bool, // YENİ
+    headless: bool,
 }
 
 impl SipEngine {
     pub async fn new(
         event_tx: mpsc::Sender<UacEvent>,
         command_rx: mpsc::Receiver<ClientCommand>,
-        headless: bool, // YENİ
+        headless: bool,
     ) -> Self {
         let (tel_tx, tel_rx) = mpsc::channel::<IngestLogRequest>(500);
         let observer_client = Arc::new(Mutex::new(None));
@@ -47,7 +47,7 @@ impl SipEngine {
             state: CallState::Idle,
             telemetry_tx: tel_tx,
             observer_client,
-            headless, // SET
+            headless,
         }
     }
 
@@ -56,7 +56,6 @@ impl SipEngine {
         client_container: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>
     ) {
         tokio::spawn(async move {
-            // tracing::info!("📡 Telemetry background worker ready.");
             while let Some(req) = rx.recv().await {
                 let mut guard = client_container.lock().await;
                 if let Some(client) = guard.as_mut() {
@@ -75,8 +74,10 @@ impl SipEngine {
     }
 
     async fn log_step(&self, msg: String, level: &str, call_id: &str) {
+        // UI'a ham metin gönder
         let _ = self.event_tx.send(UacEvent::Log(msg.clone())).await;
 
+        // Observer'a JSON gönder
         let clean_msg = msg.replace("\n", "\\n").replace("\r", "");
         
         let json_payload = json!({
@@ -99,6 +100,8 @@ impl SipEngine {
 
     pub async fn run(&mut self) {
         let local_ip = discover_local_ip();
+        
+        // [FIX]: Portu 0'a bağlamak yerine sistemin atadığı portu kullanıyoruz.
         let socket = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => Arc::new(s),
             Err(e) => {
@@ -107,8 +110,7 @@ impl SipEngine {
             }
         };
 
-        // RtpEngine başlatılırken Headless flag'ini geçir
-        self.rtp_engine = Some(RtpEngine::new(socket.clone(), self.headless));
+        // RTP Engine'i hemen başlatmıyoruz, çağrı kurulunca başlatacağız.
         let mut buf = [0u8; 4096];
 
         let mut current_target: Option<SocketAddr> = None;
@@ -120,8 +122,15 @@ impl SipEngine {
         let mut last_invite_packet: Option<Vec<u8>> = None;
         let mut retransmit_interval = tokio::time::interval(Duration::from_millis(500));
         let mut stats_ticker = tokio::time::interval(Duration::from_millis(1000));
+        
+        // [YENİ]: NAT Keep-Alive Interval (Her 15 saniyede bir ping atar)
+        let mut nat_keepalive_interval = tokio::time::interval(Duration::from_secs(15));
+        
         let mut invite_sent_time: Option<std::time::Instant> = None;
         let mut media_active_reported = false;
+
+        // RTP Engine instance'ını burada oluşturup saklıyoruz ama start() demiyoruz.
+        self.rtp_engine = Some(RtpEngine::new(socket.clone(), self.headless));
 
         loop {
             tokio::select! {
@@ -130,6 +139,7 @@ impl SipEngine {
                         ClientCommand::StartCall { target_ip, target_port, to_user, from_user } => {
                             if self.state != CallState::Idle { continue; }
                             
+                            // Observer Bağlantısı
                             let observer_url = format!("http://{}:11071", target_ip);
                             if let Ok(client) = ObserverServiceClient::connect(observer_url).await {
                                 let mut guard = self.observer_client.lock().await;
@@ -146,14 +156,19 @@ impl SipEngine {
                             let mut invite = SipPacket::new_request(Method::Invite, format!("sip:{}@{}:{}", to_user, target_ip, target_port));
                             let branch = sentiric_sip_core::utils::generate_branch_id();
 
-                            invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={}", local_ip, bound_port, branch)));
+                            // [FIX]: ;rport parametresi eklendi. Bu, sunucuya "yanıtı paketin geldiği IP:Port'a gönder" der.
+                            invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", local_ip, bound_port, branch)));
                             invite.headers.push(Header::new(HeaderName::From, format!("<sip:{}@sentiric.mobile>;tag={}", from_user, current_from_tag)));
                             invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}@{}>", to_user, target_ip)));
                             invite.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                             invite.headers.push(Header::new(HeaderName::CSeq, format!("{} INVITE", current_cseq)));
+                            
+                            // Contact header'ında gerçek Public IP'yi bilemeyiz, o yüzden yerel IP'yi yazıyoruz.
+                            // SBC'nin "rport" desteği sayesinde yanıtlar doğru yere gelecektir.
                             invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", from_user, local_ip, bound_port)));
+                            
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
-                            invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Telecom-SDK/3.0".to_string()));
+                            invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Telecom-SDK/3.1".to_string()));
 
                             let now = chrono::Utc::now().timestamp();
                             let sdp = format!(
@@ -189,26 +204,41 @@ impl SipEngine {
                 },
 
                 Ok((size, src)) = socket.recv_from(&mut buf) => {
+                    // Stun veya Keep-alive paketlerini filtrele
                     if size < 4 || (buf[0] & 0x80) != 0 { continue; }
 
                     let raw_in = String::from_utf8_lossy(&buf[..size]).to_string();
-                    self.log_step(format!("📥 RECEIVED from {}:\n{}", src, raw_in), "INFO", &current_call_id).await;
+                    
+                    // Log kirliliğini önlemek için sadece önemli paketleri logla veya debug yap
+                    if self.state != CallState::Connected {
+                        self.log_step(format!("📥 RECEIVED from {}:\n{}", src, raw_in), "INFO", &current_call_id).await;
+                    }
 
                     if let Ok(packet) = parser::parse(&buf[..size]) {
+                         // Geçici yanıt (1xx) veya Başarılı yanıt (200) geldiyse tekrar gönderimi durdur
                          if packet.is_response() && packet.status_code >= 100 { last_invite_packet = None; }
+                         
                          if packet.is_response() && packet.status_code == 200 && (self.state == CallState::Dialing || self.state == CallState::Ringing) {
                              if let Some(to) = packet.get_header_value(HeaderName::To) { current_to_tag = to.clone(); }
+                             
+                             // [KRİTİK]: RTP Hedefini bul ve motoru başlat
                              if let Some(rtp_target) = extract_rtp_target(&packet.body, &src.ip().to_string()) {
+                                 self.log_step(format!("🎤 Starting RTP Engine -> Target: {}", rtp_target), "INFO", &current_call_id).await;
                                  if let Some(rtp) = &self.rtp_engine { rtp.start(rtp_target); }
+                             } else {
+                                 self.log_step("⚠️ SDP Parsing Failed: No RTP target found!".into(), "WARN", &current_call_id).await;
                              }
+                             
+                             // ACK Gönder
                              let mut ack = SipPacket::new_request(Method::Ack, format!("sip:{}", src));
                              let branch = sentiric_sip_core::utils::generate_branch_id();
                              let bound_port = socket.local_addr().unwrap().port();
-                             ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={}", local_ip, bound_port, branch)));
+                             ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", local_ip, bound_port, branch)));
                              ack.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
                              ack.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
                              ack.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                              ack.headers.push(Header::new(HeaderName::CSeq, format!("{} ACK", current_cseq)));
+                             
                              if let Some(target) = current_target {
                                  let _ = socket.send_to(&ack.to_bytes(), target).await;
                                  self.log_step("--> ACK Sent".into(), "INFO", &current_call_id).await;
@@ -230,6 +260,18 @@ impl SipEngine {
                                     let _ = socket.send_to(packet, target).await;
                                 }
                             }
+                        }
+                    }
+                },
+
+                // [YENİ]: NAT Keep-Alive Loop
+                _ = nat_keepalive_interval.tick() => {
+                    if self.state != CallState::Idle {
+                        if let Some(target) = current_target {
+                            // Çift CRLF (RFC 5626 Ping)
+                            let keepalive = b"\r\n\r\n";
+                            let _ = socket.send_to(keepalive, target).await;
+                            // self.log_step("💓 NAT Keep-Alive Sent".into(), "DEBUG", &current_call_id).await;
                         }
                     }
                 },

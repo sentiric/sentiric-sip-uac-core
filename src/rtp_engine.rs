@@ -100,6 +100,23 @@ fn run_headless_loop(
     let freq = 1000.0;
     let sample_rate = 8000.0;
     let step = freq * 2.0 * std::f32::consts::PI / sample_rate;
+    
+    // [YENİ]: NAT Hole Punching (Başlangıçta Sessizlik Gönder)
+    // Bu işlem, sunucunun bize veri gönderebilmesi için NAT tablosunda bir giriş açar.
+    for _ in 0..10 {
+        if !is_running.load(Ordering::SeqCst) { break; }
+        
+        let silence_frame = vec![0i16; sample_per_frame];
+        let payload = encoder.encode(&silence_frame);
+        let header = RtpHeader::new(payload_type, seq, ts, ssrc);
+        let packet = RtpPacket { header, payload };
+        let _ = socket.try_send_to(&packet.to_bytes(), target);
+        
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        seq = seq.wrapping_add(1);
+        ts = ts.wrapping_add(sample_per_frame as u32);
+    }
+    info!("🕳️ NAT Hole Punching sequence sent (Headless).");
 
     while is_running.load(Ordering::SeqCst) {
         pacer.wait();
@@ -219,6 +236,21 @@ fn run_hardware_loop(
     let ssrc: u32 = rand::random();
     let sample_per_frame = codec_type.samples_per_frame(profile.ptime);
     let mut recv_buf = [0u8; 1500];
+
+    // [YENİ]: NAT Hole Punching (Hardware Mode)
+    for _ in 0..10 {
+        if !is_running.load(Ordering::SeqCst) { break; }
+        let silence_frame = vec![0i16; sample_per_frame];
+        let payload = encoder.encode(&silence_frame);
+        let header = RtpHeader::new(payload_type, seq, ts, ssrc);
+        let packet = RtpPacket { header, payload };
+        let _ = socket.try_send_to(&packet.to_bytes(), target);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        
+        seq = seq.wrapping_add(1);
+        ts = ts.wrapping_add(sample_per_frame as u32);
+    }
+    info!("🕳️ NAT Hole Punching sequence sent (Hardware).");
 
     while is_running.load(Ordering::SeqCst) {
         pacer.wait();
