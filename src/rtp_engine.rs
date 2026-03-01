@@ -195,43 +195,78 @@ fn run_hardware_loop(
     let output_device = host.default_output_device()
         .ok_or_else(|| anyhow::anyhow!("Speaker access denied or not found by OS"))?;
 
-    // [FIX]: Android VoIP modunda (MODE_IN_COMMUNICATION) Mono (1 kanal) zorunludur.
-    // Varsayılan config yerine, 1 kanallı uyumlu bir config arıyoruz.
-    let supported_input_configs = input_device.supported_input_configs()?;
-    let input_config_range = supported_input_configs
-        .filter(|c| c.channels() == 1) // Sadece Mono destekleyenleri al
-        .max_by(|a, b| a.max_sample_rate().cmp(&b.max_sample_rate())) // En yüksek kaliteyi seç
-        .ok_or_else(|| anyhow::anyhow!("No supported MONO input config found"))?;
-
+    // [FIX]: Esnek Kanal Seçimi (Adaptive Channel Selection)
+    // Önce Mono (1ch) ara, bulamazsan Stereo (2ch) kullan ve yazılımla çevir.
+    
+    // --- INPUT CONFIG ---
+    let supported_inputs = input_device.supported_input_configs()?;
+    let mut best_input_config = None;
+    
+    // 1. Tercih: Mono (En iyi performans ve AEC için)
+    for cfg in supported_inputs {
+        if cfg.channels() == 1 {
+            best_input_config = Some(cfg);
+            break; // Bulduk!
+        }
+        // Mono yoksa Stereo'yu sakla (Fallback olarak)
+        if best_input_config.is_none() && cfg.channels() == 2 {
+            best_input_config = Some(cfg);
+        }
+    }
+    
+    let input_config_range = best_input_config.ok_or_else(|| anyhow::anyhow!("No supported input config found"))?;
     let input_config: cpal::StreamConfig = input_config_range.with_max_sample_rate().into();
+    let in_channels = input_config.channels as usize;
 
-    let supported_output_configs = output_device.supported_output_configs()?;
-    let output_config_range = supported_output_configs
-        .filter(|c| c.channels() == 1) // Sadece Mono
-        .max_by(|a, b| a.max_sample_rate().cmp(&b.max_sample_rate()))
-        .ok_or_else(|| anyhow::anyhow!("No supported MONO output config found"))?;
+    // --- OUTPUT CONFIG ---
+    let supported_outputs = output_device.supported_output_configs()?;
+    let mut best_output_config = None;
+    
+    for cfg in supported_outputs {
+        if cfg.channels() == 1 {
+            best_output_config = Some(cfg);
+            break; 
+        }
+        if best_output_config.is_none() && cfg.channels() == 2 {
+            best_output_config = Some(cfg);
+        }
+    }
 
+    let output_config_range = best_output_config.ok_or_else(|| anyhow::anyhow!("No supported output config found"))?;
     let output_config: cpal::StreamConfig = output_config_range.with_max_sample_rate().into();
+    let out_channels = output_config.channels as usize;
 
     let hw_sample_rate_in = input_config.sample_rate.0 as usize;
     let hw_sample_rate_out = output_config.sample_rate.0 as usize;
     
-    info!("⚙️ Hardware Audio Config [FORCED MONO] - In: {}Hz | Out: {}Hz", 
-        hw_sample_rate_in, hw_sample_rate_out);
+    info!("⚙️ Hardware Audio Config [ADAPTIVE] - In: {}Hz {}ch | Out: {}Hz {}ch", 
+        hw_sample_rate_in, in_channels, hw_sample_rate_out, out_channels);
 
-    let rb_in = HeapRb::<f32>::new(hw_sample_rate_in * 2);
+    // Buffer'ı 1 saniyelik veri alacak şekilde genişletelim
+    let rb_in = HeapRb::<f32>::new(hw_sample_rate_in * 4); // x4 güvenlik
     let (mut mic_prod, mut mic_cons) = rb_in.split();
-    let rb_out = HeapRb::<f32>::new(hw_sample_rate_out * 2);
+    let rb_out = HeapRb::<f32>::new(hw_sample_rate_out * 4);
     let (mut spk_prod, mut spk_cons) = rb_out.split();
 
     let err_fn = |err| error!("Audio Stream Error: {}", err);
 
+    // [KRİTİK FIX]: Stereo -> Mono Downmix
     let input_stream = input_device.build_input_stream(
         &input_config, 
         move |data: &[f32], _: &_| {
-            // Veri zaten Mono geliyor, direkt bas.
-            for &sample in data {
-                let _ = mic_prod.push(sample); 
+            if in_channels == 1 {
+                // Zaten Mono, olduğu gibi bas
+                for &sample in data {
+                    let _ = mic_prod.push(sample);
+                }
+            } else {
+                // Stereo (veya çok kanallı) ise sadece ilk kanalı al (Sol)
+                // Bu işlem "Interleaved" veriyi "Mono"ya çevirir.
+                for frame in data.chunks(in_channels) {
+                    if let Some(&sample) = frame.first() {
+                        let _ = mic_prod.push(sample);
+                    }
+                }
             }
         }, 
         err_fn, 
@@ -241,8 +276,12 @@ fn run_hardware_loop(
     let output_stream = output_device.build_output_stream(
         &output_config, 
         move |data: &mut [f32], _: &_| {
-            for sample in data.iter_mut() {
-                *sample = spk_cons.pop().unwrap_or(0.0);
+            // Mono -> Stereo (veya çok kanallı) Upmix
+            for frame in data.chunks_mut(out_channels) {
+                let sample = spk_cons.pop().unwrap_or(0.0);
+                for s in frame.iter_mut() {
+                    *s = sample; 
+                }
             }
         }, 
         err_fn, 
@@ -265,7 +304,7 @@ fn run_hardware_loop(
     let ssrc: u32 = rand::random();
     let target_8k_samples = codec_type.samples_per_frame(profile.ptime);
     
-    // Chunk boyutu hesaplama (Mono olduğu için channel çarpanı yok)
+    // Chunk boyutu hesaplama (Mono'ya indirgendiği için channel çarpanı yok)
     let hw_frame_size = (hw_sample_rate_in * profile.ptime as usize) / 1000;
     
     let mut recv_buf = [0u8; 1500];
@@ -288,6 +327,7 @@ fn run_hardware_loop(
         pacer.wait();
 
         // --- TX (Mikrofon -> Ağ) ---
+        // Yeterli sample biriktiğinde işlemi yap
         if mic_cons.len() >= hw_frame_size {
             let mut mic_data = Vec::with_capacity(hw_frame_size);
             for _ in 0..hw_frame_size {
