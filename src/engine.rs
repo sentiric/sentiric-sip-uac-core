@@ -74,11 +74,11 @@ impl SipEngine {
     }
 
     // --- SUTS v4.0 COMPLIANT TELEMETRY ---
-    async fn send_telemetry(&self, severity: &str, event: &str, message: &str, call_id: &str, attributes: Value) {
+    async fn send_telemetry(&self, severity: &str, event: &str, message: &str, call_id: &str, attributes: serde_json::Value) {
         // UI için basit metin
         let _ = self.event_tx.send(UacEvent::Log(format!("[{}] {}", event, message))).await;
 
-        let node_name = "mobile-device"; // İleride OS'ten alınabilir
+        let node_name = "mobile-device";
 
         // SUTS v4 Tam Uyumlu JSON
         let json_payload = json!({
@@ -92,19 +92,16 @@ impl SipEngine {
                 "service.env": "production",
                 "host.name": node_name
             },
-            "trace_id": if call_id.is_empty() { Value::Null } else { Value::String(call_id.to_string()) },
-            "span_id": Value::Null,
+            "trace_id": if call_id.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(call_id.to_string()) },
+            "span_id": serde_json::Value::Null,
             "event": event,
             "message": message,
             "attributes": attributes
         }).to_string();
 
+        // DÜZELTME: Artık Observer'ın beklediği gibi tek bir 'raw_json_log' alanı gönderiyoruz.
         let req = IngestLogRequest {
-            service_name: "mobile-uac".into(),
-            message: json_payload,
-            level: severity.into(),
-            trace_id: call_id.into(),
-            node_id: node_name.into(), 
+            raw_json_log: json_payload,
         };
         let _ = self.telemetry_tx.try_send(req);
     }
