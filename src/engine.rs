@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use std::sync::atomic::Ordering;
-use serde_json::json;
+use serde_json::{json, Value};
 
 // Telemetry Module
 pub mod observer_proto {
@@ -73,24 +73,38 @@ impl SipEngine {
         }
     }
 
-    async fn log_step(&self, msg: String, level: &str, call_id: &str) {
-        let _ = self.event_tx.send(UacEvent::Log(msg.clone())).await;
+    // --- SUTS v4.0 COMPLIANT TELEMETRY ---
+    async fn send_telemetry(&self, severity: &str, event: &str, message: &str, call_id: &str, attributes: Value) {
+        // UI için basit metin
+        let _ = self.event_tx.send(UacEvent::Log(format!("[{}] {}", event, message))).await;
 
-        let clean_msg = msg.replace("\n", "\\n").replace("\r", "");
+        let node_name = "mobile-device"; // İleride OS'ten alınabilir
+
+        // SUTS v4 Tam Uyumlu JSON
         let json_payload = json!({
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "level": level,
-            "service": "MOBILE-SDK",
-            "call_id": call_id,
-            "message": clean_msg
+            "schema_v": "1.0.0",
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "severity": severity,
+            "tenant_id": "sentiric_demo",
+            "resource": {
+                "service.name": "mobile-uac",
+                "service.version": "1.0.0",
+                "service.env": "production",
+                "host.name": node_name
+            },
+            "trace_id": if call_id.is_empty() { Value::Null } else { Value::String(call_id.to_string()) },
+            "span_id": Value::Null,
+            "event": event,
+            "message": message,
+            "attributes": attributes
         }).to_string();
 
         let req = IngestLogRequest {
-            service_name: "MOBILE-SDK".into(),
+            service_name: "mobile-uac".into(),
             message: json_payload,
-            level: level.into(),
+            level: severity.into(),
             trace_id: call_id.into(),
-            node_id: "SDK-CLIENT".into(), 
+            node_id: node_name.into(), 
         };
         let _ = self.telemetry_tx.try_send(req);
     }
@@ -98,7 +112,6 @@ impl SipEngine {
     pub async fn run(&mut self) {
         let local_ip = discover_local_ip();
         
-        // 1. SIP Soketi (Tokio Async)
         let sip_socket = match TokioUdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => Arc::new(s),
             Err(e) => {
@@ -107,7 +120,6 @@ impl SipEngine {
             }
         };
 
-        // 2. RTP Soketi (Standart Senkron - NonBlocking)
         let rtp_socket_std = match std::net::UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => {
                 s.set_nonblocking(true).expect("Failed to set non-blocking on RTP socket");
@@ -138,7 +150,6 @@ impl SipEngine {
         let mut invite_sent_time: Option<std::time::Instant> = None;
         let mut media_active_reported = false;
 
-        // RTP Motoruna özel ayrılmış std soketini veriyoruz
         self.rtp_engine = Some(RtpEngine::new(rtp_socket_std.clone(), self.headless, self.event_tx.clone()));
 
         loop {
@@ -173,7 +184,6 @@ impl SipEngine {
                             invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Telecom-SDK/4.0".to_string()));
 
                             let now = chrono::Utc::now().timestamp();
-                            // SDP İÇİNDE RTP PORTUNU BİLDİRİYORUZ
                             let sdp = format!(
                                 "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
                                 now, now, local_ip, local_ip, rtp_port
@@ -181,7 +191,14 @@ impl SipEngine {
                             invite.body = sdp.as_bytes().to_vec();
 
                             let packet_bytes = invite.to_bytes();
-                            self.log_step(format!("📤 SENDING INVITE:\n{}", String::from_utf8_lossy(&packet_bytes)), "INFO", &current_call_id).await;
+                            
+                            self.send_telemetry("INFO", "SIP_PACKET_SENT", "INVITE sent to edge", &current_call_id, json!({
+                                "sip.method": "INVITE",
+                                "net.dst.ip": target_ip,
+                                "net.dst.port": target_port,
+                                "sip.call_id": current_call_id,
+                                "payload": String::from_utf8_lossy(&packet_bytes).to_string()
+                            })).await;
 
                             let _ = sip_socket.send_to(&packet_bytes, target_addr).await;
                             last_invite_packet = Some(packet_bytes);
@@ -204,8 +221,13 @@ impl SipEngine {
                                     current_cseq += 1;
                                     bye.headers.push(Header::new(HeaderName::CSeq, format!("{} BYE", current_cseq)));
 
-                                    let _ = sip_socket.send_to(&bye.to_bytes(), target).await;
-                                    self.log_step("📤 BYE Sent".into(), "INFO", &current_call_id).await;
+                                    let packet_bytes = bye.to_bytes();
+                                    let _ = sip_socket.send_to(&packet_bytes, target).await;
+                                    
+                                    self.send_telemetry("INFO", "SIP_PACKET_SENT", "BYE sent", &current_call_id, json!({
+                                        "sip.method": "BYE",
+                                        "payload": String::from_utf8_lossy(&packet_bytes).to_string()
+                                    })).await;
                                 }
                                 if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
                                 self.change_state(CallState::Terminated);
@@ -220,21 +242,27 @@ impl SipEngine {
                     if size < 4 || (buf[0] & 0x80) != 0 { continue; }
 
                     let raw_in = String::from_utf8_lossy(&buf[..size]).to_string();
-                    if self.state != CallState::Connected {
-                        self.log_step(format!("📥 RECEIVED from {}:\n{}", src, raw_in), "INFO", &current_call_id).await;
-                    }
-
+                    
                     if let Ok(packet) = parser::parse(&buf[..size]) {
+                         let method_or_status = if packet.is_request() { packet.method.to_string() } else { packet.status_code.to_string() };
+                         
+                         self.send_telemetry("DEBUG", "SIP_PACKET_RECEIVED", "Incoming SIP packet", &current_call_id, json!({
+                            "sip.method": method_or_status,
+                            "net.src.ip": src.ip().to_string(),
+                            "net.src.port": src.port(),
+                            "payload": raw_in
+                         })).await;
+
                          if packet.is_response() && packet.status_code >= 100 { last_invite_packet = None; }
                          
                          if packet.is_response() && packet.status_code == 200 && (self.state == CallState::Dialing || self.state == CallState::Ringing) {
                              if let Some(to) = packet.get_header_value(HeaderName::To) { current_to_tag = to.clone(); }
                              
                              if let Some(rtp_target) = extract_rtp_target(&packet.body, &src.ip().to_string()) {
-                                 self.log_step(format!("🎤 SDP Parsed. Target: {}", rtp_target), "INFO", &current_call_id).await;
+                                 self.send_telemetry("INFO", "SDP_PARSED", "Media target locked", &current_call_id, json!({"target": rtp_target.to_string()})).await;
                                  if let Some(rtp) = &self.rtp_engine { rtp.start(rtp_target); }
                              } else {
-                                 self.log_step("⚠️ SDP Parsing Failed: No RTP target found!".into(), "WARN", &current_call_id).await;
+                                 self.send_telemetry("WARN", "SDP_PARSE_FAIL", "No RTP target found in 200 OK", &current_call_id, json!({})).await;
                              }
                              
                              let mut ack = SipPacket::new_request(Method::Ack, format!("sip:{}", src));
@@ -246,8 +274,9 @@ impl SipEngine {
                              ack.headers.push(Header::new(HeaderName::CSeq, format!("{} ACK", current_cseq)));
                              
                              if let Some(target) = current_target {
-                                 let _ = sip_socket.send_to(&ack.to_bytes(), target).await;
-                                 self.log_step("--> ACK Sent".into(), "INFO", &current_call_id).await;
+                                 let ack_bytes = ack.to_bytes();
+                                 let _ = sip_socket.send_to(&ack_bytes, target).await;
+                                 self.send_telemetry("INFO", "SIP_PACKET_SENT", "Auto-ACK sent", &current_call_id, json!({"sip.method": "ACK"})).await;
                              }
                              self.change_state(CallState::Connected);
                          }
@@ -259,7 +288,7 @@ impl SipEngine {
                         if let Some(target) = current_target {
                             if let Some(start_time) = invite_sent_time {
                                 if start_time.elapsed() > Duration::from_secs(5) {
-                                    self.log_step("❌ Connection Failure: SBC Timeout".into(), "ERROR", &current_call_id).await;
+                                    self.send_telemetry("ERROR", "CALL_TIMEOUT", "SBC did not respond to INVITE", &current_call_id, json!({})).await;
                                     last_invite_packet = None;
                                     self.change_state(CallState::Terminated);
                                 } else {
@@ -287,7 +316,7 @@ impl SipEngine {
                             let _ = self.event_tx.try_send(UacEvent::RtpStats { rx_cnt: rx, tx_cnt: tx });
                             if !media_active_reported && rx > 10 {
                                 media_active_reported = true;
-                                self.log_step("🟢 MEDIA ACTIVE: Session flow verified.".into(), "INFO", &current_call_id).await;
+                                self.send_telemetry("INFO", "MEDIA_ACTIVE", "2-Way audio flow verified", &current_call_id, json!({"rx": rx, "tx": tx})).await;
                                 let _ = self.event_tx.try_send(UacEvent::MediaActive);
                             }
                         }
