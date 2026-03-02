@@ -1,9 +1,9 @@
 // sentiric-telecom-client-sdk/src/rtp_engine.rs
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex}; // Mutex eklendi
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use ringbuf::HeapRb;
+use ringbuf::{HeapRb, Producer, Consumer};
 use tracing::{info, error, debug, warn};
 use sentiric_rtp_core::{AudioProfile, CodecFactory, Pacer, RtpHeader, RtpPacket, simple_resample};
 use std::panic;
@@ -52,7 +52,7 @@ impl RtpEngine {
                 
                 let result = panic::catch_unwind(move || {
                     if headless {
-                        let _ = ui_tx_inner.blocking_send(UacEvent::Log("👻 Booting Virtual DSP (Headless Mode for CLI/CI)".into()));
+                        let _ = ui_tx_inner.blocking_send(UacEvent::Log("👻 Booting Virtual DSP (Headless Mode)".into()));
                         if let Err(e) = run_headless_loop(is_running_inner.clone(), socket, target, rx_cnt, tx_cnt) {
                             let _ = ui_tx_inner.blocking_send(UacEvent::Error(format!("Virtual DSP Error: {}", e)));
                         }
@@ -92,7 +92,6 @@ impl RtpEngine {
 }
 
 // --- SANAL (HEADLESS) AUDIO LOOP ---
-// CLI Aracı ve CI/CD testleri için kullanılır.
 fn run_headless_loop(
     is_running: Arc<AtomicBool>, 
     socket: Arc<UdpSocket>, 
@@ -114,13 +113,11 @@ fn run_headless_loop(
     let sample_per_frame = codec_type.samples_per_frame(profile.ptime);
     let mut recv_buf = [0u8; 1500];
 
-    // Sinüs dalgası üretimi için
     let mut phase: f32 = 0.0;
-    let freq = 440.0; // A4 Notası
+    let freq = 440.0; 
     let sample_rate = 8000.0;
     let step = freq * 2.0 * std::f32::consts::PI / sample_rate;
     
-    // NAT Hole Punching
     info!("🕳️ [Headless] Sending NAT Hole Punch packets...");
     for _ in 0..5 {
         if !is_running.load(Ordering::SeqCst) { break; }
@@ -139,7 +136,7 @@ fn run_headless_loop(
     while is_running.load(Ordering::SeqCst) {
         pacer.wait();
 
-        // --- TX: Sinüs Dalgası Üret ve Gönder ---
+        // TX
         let mut pcm_frame = Vec::with_capacity(sample_per_frame);
         for _ in 0..sample_per_frame {
             let val = (phase.sin() * 10000.0) as i16; 
@@ -165,25 +162,19 @@ fn run_headless_loop(
             ts = ts.wrapping_add(sample_per_frame as u32);
         }
 
-        // --- RX: Veriyi Al ve Analiz Et (CLI Telemetrisi için) ---
+        // RX
         loop {
             match socket.recv_from(&mut recv_buf) {
                 Ok((len, _)) => {
                     if len > 12 {
                         rx_cnt.fetch_add(1, Ordering::Relaxed);
                         let payload = &recv_buf[12..len];
-                        
                         let samples = decoder.decode(payload);
                         
-                        // Basit RMS Hesaplama
                         if !samples.is_empty() && seq % 100 == 0 {
                              let mut sum_sq = 0.0;
-                             for s in &samples {
-                                 // [FIX]: Parantezler kaldırıldı.
-                                 sum_sq += *s as f32 * *s as f32;
-                             }
+                             for s in &samples { sum_sq += *s as f32 * *s as f32; }
                              let rms = (sum_sq / samples.len() as f32).sqrt();
-                             
                              if rms > 100.0 {
                                 debug!("🔊 [Headless RX] Voice Signal Detected! Level: {:.2}", rms);
                              }
@@ -198,8 +189,8 @@ fn run_headless_loop(
     Ok(())
 }
 
-// --- DONANIM (HARDWARE) LOOP ---
-// [CRITICAL UPDATE]: Safe Default Configuration (Mobil Cihazlar İçin)
+// --- DONANIM (HARDWARE) LOOP [SELF-HEALING v3 - MUTEX PROTECTED] ---
+// Ses akışı kopsa bile (Hoparlör değişimi vb.) bufferı koruyarak yeniden başlatır.
 fn run_hardware_loop(
     is_running: Arc<AtomicBool>, 
     socket: Arc<UdpSocket>, 
@@ -209,66 +200,17 @@ fn run_hardware_loop(
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
     
-    let input_device = host.default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("Microphone access denied or not found by OS"))?;
-    
-    let output_device = host.default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("Speaker access denied or not found by OS"))?;
+    // [ARCH-FIX]: RingBuffer uçlarını Arc<Mutex<...>> içine alıyoruz.
+    // Böylece Closure'lara klonlarını gönderebiliriz ve döngü içinde tekrar kullanabiliriz.
+    let rb_in = HeapRb::<f32>::new(48000 * 4); 
+    let (mic_prod, mut mic_cons) = rb_in.split();
+    let shared_mic_prod = Arc::new(Mutex::new(mic_prod)); // PAYLAŞILABİLİR ÜRETİCİ
 
-    // [SAFE-DEFAULT]: OS varsayılanlarını kullan
-    let input_config = input_device.default_input_config()
-        .map_err(|e| anyhow::anyhow!("Failed to get default input config: {}", e))?;
-    
-    let output_config = output_device.default_output_config()
-        .map_err(|e| anyhow::anyhow!("Failed to get default output config: {}", e))?;
+    let rb_out = HeapRb::<f32>::new(48000 * 4);
+    let (mut spk_prod, spk_cons) = rb_out.split();
+    let shared_spk_cons = Arc::new(Mutex::new(spk_cons)); // PAYLAŞILABİLİR TÜKETİCİ
 
-    let in_channels = input_config.channels() as usize;
-    let out_channels = output_config.channels() as usize;
-    
-    let hw_sample_rate_in = input_config.sample_rate().0 as usize;
-    let hw_sample_rate_out = output_config.sample_rate().0 as usize;
-
-    info!("⚙️ Hardware Audio Config [SAFE-DEFAULT] - In: {}Hz {}ch | Out: {}Hz {}ch", 
-        hw_sample_rate_in, in_channels, hw_sample_rate_out, out_channels);
-
-    let input_stream_config: cpal::StreamConfig = input_config.into();
-    let output_stream_config: cpal::StreamConfig = output_config.into();
-
-    let rb_in = HeapRb::<f32>::new(hw_sample_rate_in * 4); 
-    let (mut mic_prod, mut mic_cons) = rb_in.split();
-    let rb_out = HeapRb::<f32>::new(hw_sample_rate_out * 4);
-    let (mut spk_prod, mut spk_cons) = rb_out.split();
-
-    let err_fn = |err| error!("Audio Stream Error: {}", err);
-
-    let input_stream = input_device.build_input_stream(
-        &input_stream_config, 
-        move |data: &[f32], _: &_| {
-            if in_channels == 1 {
-                for &sample in data { let _ = mic_prod.push(sample); }
-            } else {
-                for frame in data.chunks(in_channels) {
-                    if let Some(&sample) = frame.first() { let _ = mic_prod.push(sample); }
-                }
-            }
-        }, 
-        err_fn, None
-    ).map_err(|e| anyhow::anyhow!("build_input_stream failed: {}", e))?;
-
-    let output_stream = output_device.build_output_stream(
-        &output_stream_config, 
-        move |data: &mut [f32], _: &_| {
-            for frame in data.chunks_mut(out_channels) {
-                let sample = spk_cons.pop().unwrap_or(0.0);
-                for s in frame.iter_mut() { *s = sample; }
-            }
-        }, 
-        err_fn, None
-    ).map_err(|e| anyhow::anyhow!("build_output_stream failed: {}", e))?;
-
-    input_stream.play()?;
-    output_stream.play()?;
-    
+    // Codec ve RTP Hazırlığı
     let profile = AudioProfile::default();
     let codec_type = profile.preferred_audio_codec();
     let payload_type = profile.get_by_payload(codec_type as u8).map(|c| c.payload_type).unwrap_or(0);
@@ -281,14 +223,14 @@ fn run_hardware_loop(
     let mut ts: u32 = rand::random();
     let ssrc: u32 = rand::random();
     let target_8k_samples = codec_type.samples_per_frame(profile.ptime);
-    let hw_frame_size = (hw_sample_rate_in * profile.ptime as usize) / 1000;
-    
     let mut recv_buf = [0u8; 1500];
 
+    // NAT Hole Punching
+    info!("🕳️ NAT Hole Punching sequence sent...");
     for _ in 0..10 {
         if !is_running.load(Ordering::SeqCst) { break; }
-        let silence_frame = vec![0i16; target_8k_samples];
-        let payload = encoder.encode(&silence_frame);
+        let silence = vec![0i16; target_8k_samples];
+        let payload = encoder.encode(&silence);
         let header = RtpHeader::new(payload_type, seq, ts, ssrc);
         let packet = RtpPacket { header, payload };
         let _ = socket.send_to(&packet.to_bytes(), target);
@@ -296,51 +238,159 @@ fn run_hardware_loop(
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(target_8k_samples as u32);
     }
-    info!("🕳️ NAT Hole Punching sequence sent. Media flowing...");
 
+    // --- RECOVERY LOOP ---
     while is_running.load(Ordering::SeqCst) {
-        pacer.wait();
-
-        if mic_cons.len() >= hw_frame_size {
-            let mut mic_data = Vec::with_capacity(hw_frame_size);
-            for _ in 0..hw_frame_size {
-                let s = mic_cons.pop().unwrap_or(0.0);
-                mic_data.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+        
+        // 1. Cihazları ve Konfigürasyonu Al
+        let input_device = match host.default_input_device() {
+            Some(d) => d,
+            None => {
+                error!("❌ No input device found! Retrying in 1s...");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
             }
+        };
+        let output_device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                error!("❌ No output device found! Retrying in 1s...");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
 
-            let resampled = simple_resample(&mic_data, hw_sample_rate_in, 8000);
-            
-            for chunk in resampled.chunks(target_8k_samples) {
-                if chunk.len() < target_8k_samples { continue; }
-                let payload = encoder.encode(chunk);
-                if payload.is_empty() { continue; }
+        let input_config = match input_device.default_input_config() {
+            Ok(c) => c,
+            Err(e) => { error!("Input config error: {}", e); std::thread::sleep(std::time::Duration::from_secs(1)); continue; }
+        };
+        let output_config = match output_device.default_output_config() {
+            Ok(c) => c,
+            Err(e) => { error!("Output config error: {}", e); std::thread::sleep(std::time::Duration::from_secs(1)); continue; }
+        };
 
-                let header = RtpHeader::new(payload_type, seq, ts, ssrc);
-                let packet = RtpPacket { header, payload };
-                match socket.send_to(&packet.to_bytes(), target) {
-                    Ok(_) => { tx_cnt.fetch_add(1, Ordering::Relaxed); },
-                    Err(_) => {},
+        let hw_sample_rate_in = input_config.sample_rate().0 as usize;
+        let hw_sample_rate_out = output_config.sample_rate().0 as usize;
+        let in_channels = input_config.channels() as usize;
+        let out_channels = output_config.channels() as usize;
+        
+        let hw_frame_size = (hw_sample_rate_in * profile.ptime as usize) / 1000;
+
+        info!("🔄 (Re)Starting Audio Stream: In: {}Hz {}ch | Out: {}Hz {}ch", hw_sample_rate_in, in_channels, hw_sample_rate_out, out_channels);
+
+        // 2. Akışın Sağlık Durumunu İzlemek İçin Bayrak
+        let stream_healthy = Arc::new(AtomicBool::new(true));
+        let stream_healthy_in = stream_healthy.clone();
+        let stream_healthy_out = stream_healthy.clone();
+
+        let err_fn_in = move |err| {
+            error!("🎤 Input Stream Error/Disconnect: {}", err);
+            stream_healthy_in.store(false, Ordering::SeqCst); 
+        };
+        let err_fn_out = move |err| {
+            error!("🔈 Output Stream Error/Disconnect: {}", err);
+            stream_healthy_out.store(false, Ordering::SeqCst); 
+        };
+
+        let input_stream_config: cpal::StreamConfig = input_config.into();
+        let output_stream_config: cpal::StreamConfig = output_config.into();
+
+        // [ARCH-FIX]: Closure içine klonları gönderiyoruz
+        let mic_prod_clone = shared_mic_prod.clone();
+        let input_stream = match input_device.build_input_stream(
+            &input_stream_config, 
+            move |data: &[f32], _: &_| {
+                if let Ok(mut producer) = mic_prod_clone.try_lock() {
+                    if in_channels == 1 {
+                        for &sample in data { let _ = producer.push(sample); }
+                    } else {
+                        for frame in data.chunks(in_channels) {
+                            if let Some(&sample) = frame.first() { let _ = producer.push(sample); }
+                        }
+                    }
                 }
-                seq = seq.wrapping_add(1);
-                ts = ts.wrapping_add(target_8k_samples as u32);
+            }, 
+            err_fn_in, None
+        ) {
+            Ok(s) => s,
+            Err(e) => { error!("Build Input Failed: {}", e); std::thread::sleep(std::time::Duration::from_secs(1)); continue; }
+        };
+
+        let spk_cons_clone = shared_spk_cons.clone();
+        let output_stream = match output_device.build_output_stream(
+            &output_stream_config, 
+            move |data: &mut [f32], _: &_| {
+                if let Ok(mut consumer) = spk_cons_clone.try_lock() {
+                    for frame in data.chunks_mut(out_channels) {
+                        let sample = consumer.pop().unwrap_or(0.0);
+                        for s in frame.iter_mut() { *s = sample; }
+                    }
+                } else {
+                    // Lock alınamazsa sessizlik bas (Cızırtıyı önler)
+                     for s in data.iter_mut() { *s = 0.0; }
+                }
+            }, 
+            err_fn_out, None
+        ) {
+            Ok(s) => s,
+            Err(e) => { error!("Build Output Failed: {}", e); std::thread::sleep(std::time::Duration::from_secs(1)); continue; }
+        };
+
+        if let Err(e) = input_stream.play() { error!("Play Input Failed: {}", e); continue; }
+        if let Err(e) = output_stream.play() { error!("Play Output Failed: {}", e); continue; }
+
+        // 5. RTP Döngüsü (Akış sağlıklı olduğu sürece)
+        while is_running.load(Ordering::SeqCst) && stream_healthy.load(Ordering::SeqCst) {
+            pacer.wait();
+
+            // TX (Mic -> Net)
+            if mic_cons.len() >= hw_frame_size {
+                let mut mic_data = Vec::with_capacity(hw_frame_size);
+                for _ in 0..hw_frame_size {
+                    let s = mic_cons.pop().unwrap_or(0.0);
+                    mic_data.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+                }
+
+                let resampled = simple_resample(&mic_data, hw_sample_rate_in, 8000);
+                
+                for chunk in resampled.chunks(target_8k_samples) {
+                    if chunk.len() < target_8k_samples { continue; }
+                    let payload = encoder.encode(chunk);
+                    if payload.is_empty() { continue; }
+
+                    let header = RtpHeader::new(payload_type, seq, ts, ssrc);
+                    let packet = RtpPacket { header, payload };
+                    match socket.send_to(&packet.to_bytes(), target) {
+                        Ok(_) => { tx_cnt.fetch_add(1, Ordering::Relaxed); },
+                        Err(_) => {},
+                    }
+                    seq = seq.wrapping_add(1);
+                    ts = ts.wrapping_add(target_8k_samples as u32);
+                }
+            }
+
+            // RX (Net -> Speaker)
+            loop {
+                match socket.recv_from(&mut recv_buf) {
+                    Ok((len, _src)) => {
+                        if len > 12 {
+                            rx_cnt.fetch_add(1, Ordering::Relaxed);
+                            let payload = &recv_buf[12..len];
+                            let samples_8k = decoder.decode(payload);
+                            let resampled_out = simple_resample(&samples_8k, 8000, hw_sample_rate_out);
+                            for s in resampled_out { let _ = spk_prod.push(s as f32 / 32768.0); }
+                        }
+                    },
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
             }
         }
-
-        loop {
-             match socket.recv_from(&mut recv_buf) {
-                 Ok((len, _src)) => {
-                     if len > 12 {
-                         rx_cnt.fetch_add(1, Ordering::Relaxed);
-                         let payload = &recv_buf[12..len];
-                         let samples_8k = decoder.decode(payload);
-                         let resampled_out = simple_resample(&samples_8k, 8000, hw_sample_rate_out);
-                         for s in resampled_out { let _ = spk_prod.push(s as f32 / 32768.0); }
-                     }
-                 },
-                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                 Err(_) => break,
-             }
-        }
+        
+        info!("⚠️ Stream interrupted or call ended. Recovering...");
+        // Akış nesneleri burada scope dışına çıkar ve yok edilir (Drop)
+        // Ancak 'shared_mic_prod' ve 'shared_spk_cons' hayatta kalır.
     }
+    
     Ok(())
 }
