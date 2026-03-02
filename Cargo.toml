@@ -1,9 +1,10 @@
 [package]
 name = "sentiric-telecom-client-sdk"
-version = "0.3.12"
+version = "0.3.13" # [BUMP]
 edition = "2021"
 authors = ["Sentiric Team <dev@sentiric.ai>"]
 description = "Hardened Stateful SIP/RTP Engine with Real-time Media Telemetry"
+
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]

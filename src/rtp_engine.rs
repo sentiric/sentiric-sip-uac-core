@@ -1,15 +1,19 @@
 // sentiric-telecom-client-sdk/src/rtp_engine.rs
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::{Arc, Mutex}; // Mutex eklendi
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use ringbuf::{HeapRb, Producer, Consumer};
+use ringbuf::HeapRb;
 use tracing::{info, error, debug, warn};
 use sentiric_rtp_core::{AudioProfile, CodecFactory, Pacer, RtpHeader, RtpPacket, simple_resample};
 use std::panic;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::sync::mpsc;
 use crate::UacEvent; 
+
+// [TUNING]: Dijital Ses Kazancı (Volume Boost)
+// Mobil hoparlörler için sesi 2.5 katına çıkarır.
+const AUDIO_GAIN: f32 = 2.5;
 
 pub struct RtpEngine {
     socket: Arc<UdpSocket>,
@@ -59,13 +63,10 @@ impl RtpEngine {
                     } else {
                         let _ = ui_tx_inner.blocking_send(UacEvent::Log("🎤 Connecting to Hardware Mic/Speaker...".into()));
                         
-                        // Hardware Loop (Mobile)
                         if let Err(e) = run_hardware_loop(is_running_inner.clone(), socket.clone(), target, rx_cnt.clone(), tx_cnt.clone()) {
-                            
                             let err_msg = format!("⚠️ Hardware Audio Failed: {}. FALLING BACK TO VIRTUAL AUDIO!", e);
                             let _ = ui_tx_inner.blocking_send(UacEvent::Log(err_msg));
                             
-                            // Fallback to Headless
                             if let Err(fallback_err) = run_headless_loop(is_running_inner.clone(), socket, target, rx_cnt, tx_cnt) {
                                 let _ = ui_tx_inner.blocking_send(UacEvent::Error(format!("Fallback also failed: {}", fallback_err)));
                             }
@@ -189,8 +190,7 @@ fn run_headless_loop(
     Ok(())
 }
 
-// --- DONANIM (HARDWARE) LOOP [SELF-HEALING v3 - MUTEX PROTECTED] ---
-// Ses akışı kopsa bile (Hoparlör değişimi vb.) bufferı koruyarak yeniden başlatır.
+// --- DONANIM (HARDWARE) LOOP [SELF-HEALING v4 - FINAL] ---
 fn run_hardware_loop(
     is_running: Arc<AtomicBool>, 
     socket: Arc<UdpSocket>, 
@@ -200,17 +200,15 @@ fn run_hardware_loop(
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
     
-    // [ARCH-FIX]: RingBuffer uçlarını Arc<Mutex<...>> içine alıyoruz.
-    // Böylece Closure'lara klonlarını gönderebiliriz ve döngü içinde tekrar kullanabiliriz.
-    let rb_in = HeapRb::<f32>::new(48000 * 4); 
+    // [MEMORY]: RingBuffer kapasitesini artırdık
+    let rb_in = HeapRb::<f32>::new(48000 * 8); 
     let (mic_prod, mut mic_cons) = rb_in.split();
-    let shared_mic_prod = Arc::new(Mutex::new(mic_prod)); // PAYLAŞILABİLİR ÜRETİCİ
+    let shared_mic_prod = Arc::new(Mutex::new(mic_prod));
 
-    let rb_out = HeapRb::<f32>::new(48000 * 4);
+    let rb_out = HeapRb::<f32>::new(48000 * 8);
     let (mut spk_prod, spk_cons) = rb_out.split();
-    let shared_spk_cons = Arc::new(Mutex::new(spk_cons)); // PAYLAŞILABİLİR TÜKETİCİ
+    let shared_spk_cons = Arc::new(Mutex::new(spk_cons));
 
-    // Codec ve RTP Hazırlığı
     let profile = AudioProfile::default();
     let codec_type = profile.preferred_audio_codec();
     let payload_type = profile.get_by_payload(codec_type as u8).map(|c| c.payload_type).unwrap_or(0);
@@ -225,7 +223,6 @@ fn run_hardware_loop(
     let target_8k_samples = codec_type.samples_per_frame(profile.ptime);
     let mut recv_buf = [0u8; 1500];
 
-    // NAT Hole Punching
     info!("🕳️ NAT Hole Punching sequence sent...");
     for _ in 0..10 {
         if !is_running.load(Ordering::SeqCst) { break; }
@@ -239,10 +236,7 @@ fn run_hardware_loop(
         ts = ts.wrapping_add(target_8k_samples as u32);
     }
 
-    // --- RECOVERY LOOP ---
     while is_running.load(Ordering::SeqCst) {
-        
-        // 1. Cihazları ve Konfigürasyonu Al
         let input_device = match host.default_input_device() {
             Some(d) => d,
             None => {
@@ -278,7 +272,6 @@ fn run_hardware_loop(
 
         info!("🔄 (Re)Starting Audio Stream: In: {}Hz {}ch | Out: {}Hz {}ch", hw_sample_rate_in, in_channels, hw_sample_rate_out, out_channels);
 
-        // 2. Akışın Sağlık Durumunu İzlemek İçin Bayrak
         let stream_healthy = Arc::new(AtomicBool::new(true));
         let stream_healthy_in = stream_healthy.clone();
         let stream_healthy_out = stream_healthy.clone();
@@ -295,17 +288,17 @@ fn run_hardware_loop(
         let input_stream_config: cpal::StreamConfig = input_config.into();
         let output_stream_config: cpal::StreamConfig = output_config.into();
 
-        // [ARCH-FIX]: Closure içine klonları gönderiyoruz
         let mic_prod_clone = shared_mic_prod.clone();
         let input_stream = match input_device.build_input_stream(
             &input_stream_config, 
             move |data: &[f32], _: &_| {
                 if let Ok(mut producer) = mic_prod_clone.try_lock() {
+                    // [GAIN]: Giriş sesini artırıyoruz (Mikrofon hassasiyeti)
                     if in_channels == 1 {
-                        for &sample in data { let _ = producer.push(sample); }
+                        for &sample in data { let _ = producer.push(sample * AUDIO_GAIN); }
                     } else {
                         for frame in data.chunks(in_channels) {
-                            if let Some(&sample) = frame.first() { let _ = producer.push(sample); }
+                            if let Some(&sample) = frame.first() { let _ = producer.push(sample * AUDIO_GAIN); }
                         }
                     }
                 }
@@ -322,11 +315,13 @@ fn run_hardware_loop(
             move |data: &mut [f32], _: &_| {
                 if let Ok(mut consumer) = spk_cons_clone.try_lock() {
                     for frame in data.chunks_mut(out_channels) {
-                        let sample = consumer.pop().unwrap_or(0.0);
-                        for s in frame.iter_mut() { *s = sample; }
+                        // [GAIN]: Çıkış sesini artırıyoruz (Hoparlör Sesi)
+                        // [LIMITER]: .clamp() ile patlamayı önlüyoruz
+                        let sample = consumer.pop().unwrap_or(0.0) * AUDIO_GAIN;
+                        let safe_sample = sample.clamp(-1.0, 1.0);
+                        for s in frame.iter_mut() { *s = safe_sample; }
                     }
                 } else {
-                    // Lock alınamazsa sessizlik bas (Cızırtıyı önler)
                      for s in data.iter_mut() { *s = 0.0; }
                 }
             }, 
@@ -339,7 +334,6 @@ fn run_hardware_loop(
         if let Err(e) = input_stream.play() { error!("Play Input Failed: {}", e); continue; }
         if let Err(e) = output_stream.play() { error!("Play Output Failed: {}", e); continue; }
 
-        // 5. RTP Döngüsü (Akış sağlıklı olduğu sürece)
         while is_running.load(Ordering::SeqCst) && stream_healthy.load(Ordering::SeqCst) {
             pacer.wait();
 
@@ -348,6 +342,7 @@ fn run_hardware_loop(
                 let mut mic_data = Vec::with_capacity(hw_frame_size);
                 for _ in 0..hw_frame_size {
                     let s = mic_cons.pop().unwrap_or(0.0);
+                    // Soft clip before int16 conversion
                     mic_data.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
                 }
 
@@ -378,7 +373,11 @@ fn run_hardware_loop(
                             let payload = &recv_buf[12..len];
                             let samples_8k = decoder.decode(payload);
                             let resampled_out = simple_resample(&samples_8k, 8000, hw_sample_rate_out);
-                            for s in resampled_out { let _ = spk_prod.push(s as f32 / 32768.0); }
+                            for s in resampled_out { 
+                                // Buradaki ham veriyi buffer'a atıyoruz. 
+                                // Gain, output callback içinde uygulanıyor.
+                                let _ = spk_prod.push(s as f32 / 32768.0); 
+                            }
                         }
                     },
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -388,8 +387,6 @@ fn run_hardware_loop(
         }
         
         info!("⚠️ Stream interrupted or call ended. Recovering...");
-        // Akış nesneleri burada scope dışına çıkar ve yok edilir (Drop)
-        // Ancak 'shared_mic_prod' ve 'shared_spk_cons' hayatta kalır.
     }
     
     Ok(())
