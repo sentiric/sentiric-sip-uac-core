@@ -10,7 +10,8 @@ use std::time::Duration;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use std::sync::atomic::Ordering;
-use serde_json::{json, Value};
+// [FIX]: 'Value' kaldırıldı.
+use serde_json::json; 
 
 // Telemetry Module
 pub mod observer_proto {
