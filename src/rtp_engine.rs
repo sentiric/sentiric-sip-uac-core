@@ -11,9 +11,11 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::sync::mpsc;
 use crate::UacEvent; 
 
-// [TUNING]: Dijital Ses Kazancı (Volume Boost)
-// Mobil hoparlörler için sesi 2.5 katına çıkarır.
-const AUDIO_GAIN: f32 = 2.5;
+// [KRİTİK DÜZELTME]: Gain değerleri ayrıştırıldı.
+// Mikrofon sesi orijinal bırakıldı (Gürültü artışını/boğukluğu engeller).
+const MIC_GAIN: f32 = 1.0;     
+// Hoparlör sesi makul bir seviyede artırıldı.
+const SPEAKER_GAIN: f32 = 1.5; 
 
 pub struct RtpEngine {
     socket: Arc<UdpSocket>,
@@ -190,7 +192,7 @@ fn run_headless_loop(
     Ok(())
 }
 
-// --- DONANIM (HARDWARE) LOOP [SELF-HEALING v4 - FINAL] ---
+// --- DONANIM (HARDWARE) LOOP [SELF-HEALING v5 - STUDIO QUALITY] ---
 fn run_hardware_loop(
     is_running: Arc<AtomicBool>, 
     socket: Arc<UdpSocket>, 
@@ -200,7 +202,6 @@ fn run_hardware_loop(
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
     
-    // [MEMORY]: RingBuffer kapasitesini artırdık
     let rb_in = HeapRb::<f32>::new(48000 * 8); 
     let (mic_prod, mut mic_cons) = rb_in.split();
     let shared_mic_prod = Arc::new(Mutex::new(mic_prod));
@@ -289,16 +290,24 @@ fn run_hardware_loop(
         let output_stream_config: cpal::StreamConfig = output_config.into();
 
         let mic_prod_clone = shared_mic_prod.clone();
+        
+        // --- MİKROFON YAKALAMA (DÜZELTİLDİ) ---
         let input_stream = match input_device.build_input_stream(
             &input_stream_config, 
             move |data: &[f32], _: &_| {
                 if let Ok(mut producer) = mic_prod_clone.try_lock() {
-                    // [GAIN]: Giriş sesini artırıyoruz (Mikrofon hassasiyeti)
                     if in_channels == 1 {
-                        for &sample in data { let _ = producer.push(sample * AUDIO_GAIN); }
+                        for &sample in data { 
+                            let _ = producer.push(sample * MIC_GAIN); 
+                        }
                     } else {
+                        // [KRİTİK DÜZELTME]: Stereo mikrofondan sesi alırken sadece sol kanalı almak yerine
+                        // her iki kanalın ortalamasını alıyoruz (Mix to Mono). Bu sayede ses çok daha tok çıkar.
                         for frame in data.chunks(in_channels) {
-                            if let Some(&sample) = frame.first() { let _ = producer.push(sample * AUDIO_GAIN); }
+                            let mut sum = 0.0;
+                            for &s in frame { sum += s; }
+                            let avg_sample = sum / in_channels as f32;
+                            let _ = producer.push(avg_sample * MIC_GAIN);
                         }
                     }
                 }
@@ -310,14 +319,14 @@ fn run_hardware_loop(
         };
 
         let spk_cons_clone = shared_spk_cons.clone();
+        
+        // --- HOPARLÖR ÇIKTI (DÜZELTİLDİ) ---
         let output_stream = match output_device.build_output_stream(
             &output_stream_config, 
             move |data: &mut [f32], _: &_| {
                 if let Ok(mut consumer) = spk_cons_clone.try_lock() {
                     for frame in data.chunks_mut(out_channels) {
-                        // [GAIN]: Çıkış sesini artırıyoruz (Hoparlör Sesi)
-                        // [LIMITER]: .clamp() ile patlamayı önlüyoruz
-                        let sample = consumer.pop().unwrap_or(0.0) * AUDIO_GAIN;
+                        let sample = consumer.pop().unwrap_or(0.0) * SPEAKER_GAIN;
                         let safe_sample = sample.clamp(-1.0, 1.0);
                         for s in frame.iter_mut() { *s = safe_sample; }
                     }
@@ -342,7 +351,6 @@ fn run_hardware_loop(
                 let mut mic_data = Vec::with_capacity(hw_frame_size);
                 for _ in 0..hw_frame_size {
                     let s = mic_cons.pop().unwrap_or(0.0);
-                    // Soft clip before int16 conversion
                     mic_data.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
                 }
 
@@ -374,8 +382,6 @@ fn run_hardware_loop(
                             let samples_8k = decoder.decode(payload);
                             let resampled_out = simple_resample(&samples_8k, 8000, hw_sample_rate_out);
                             for s in resampled_out { 
-                                // Buradaki ham veriyi buffer'a atıyoruz. 
-                                // Gain, output callback içinde uygulanıyor.
                                 let _ = spk_prod.push(s as f32 / 32768.0); 
                             }
                         }
