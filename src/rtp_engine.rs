@@ -214,12 +214,13 @@ fn run_hardware_loop(
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
     
-    // [KESİKLİK ÇÖZÜMÜ]: RingBuffer boyutları artırıldı. Mobil dalgalanmalar (Jitter) sesin kesilmesine neden olmaz.
-    let rb_in = HeapRb::<f32>::new(48000 * 16); 
+    // [TUNING 1]: Buffer Boyutunu 2 Katına Çıkar (Gecikme +20ms artar ama kesinti biter)
+    // 48000 * 32 (yaklaşık 600ms buffer alanı)
+    let rb_in = HeapRb::<f32>::new(48000 * 32); 
     let (mic_prod, mut mic_cons) = rb_in.split();
     let shared_mic_prod = Arc::new(Mutex::new(mic_prod));
 
-    let rb_out = HeapRb::<f32>::new(48000 * 16);
+    let rb_out = HeapRb::<f32>::new(48000 * 32);
     let (mut spk_prod, spk_cons) = rb_out.split();
     let shared_spk_cons = Arc::new(Mutex::new(spk_cons));
 
