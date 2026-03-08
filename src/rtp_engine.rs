@@ -254,14 +254,10 @@ fn run_hardware_loop(
             }
         };
 
-        // [KRİTİK DÜZELTME]: Android'de default_input_config bazen desteklenmeyen 
-        // kanal (Stereo) atamaya çalışır. Cpal çöker.
-        // Güvenli (Fallback) konfigürasyon arama mantığı eklendi:
         let input_config = match input_device.default_input_config() {
             Ok(c) => c,
             Err(e) => { 
                 warn!("Default Input config error: {}. Trying fallback configs...", e); 
-                // Cpal destekli konfigürasyonları ara
                 if let Ok(mut supported_configs) = input_device.supported_input_configs() {
                     if let Some(config) = supported_configs.next() {
                         config.with_max_sample_rate()
@@ -370,11 +366,16 @@ fn run_hardware_loop(
         if let Err(e) = input_stream.play() { error!("Play Input Failed: {}", e); continue; }
         if let Err(e) = output_stream.play() { error!("Play Output Failed: {}", e); continue; }
 
+        // [MİMARİ DÜZELTME]: Loop başlamadan önce biriken çöp ve gecikme backlog'unu temizle (Drain)
+        // Böylece cızırtı ve 6 saniyelik zaman kayması engellenir.
+        while mic_cons.pop().is_some() {}
+
         while is_running.load(Ordering::SeqCst) && stream_healthy.load(Ordering::SeqCst) {
             pacer.wait();
 
-            // TX (Mic -> Net)
-            if mic_cons.len() >= hw_frame_size {
+            // [MİMARİ DÜZELTME]: IF yerine WHILE. 
+            // Thread gecikirse birikmiş olan tüm frame'leri art arda işleyerek gerçek zamana (catch-up) yetişir.
+            while mic_cons.len() >= hw_frame_size {
                 let mut mic_data = Vec::with_capacity(hw_frame_size);
                 for _ in 0..hw_frame_size {
                     let s = mic_cons.pop().unwrap_or(0.0);
