@@ -214,8 +214,6 @@ fn run_hardware_loop(
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
     
-    // [TUNING 1]: Buffer Boyutunu 2 Katına Çıkar (Gecikme +20ms artar ama kesinti biter)
-    // 48000 * 32 (yaklaşık 600ms buffer alanı)
     let rb_in = HeapRb::<f32>::new(48000 * 32); 
     let (mic_prod, mut mic_cons) = rb_in.split();
     let shared_mic_prod = Arc::new(Mutex::new(mic_prod));
@@ -238,19 +236,6 @@ fn run_hardware_loop(
     let target_8k_samples = codec_type.samples_per_frame(profile.ptime);
     let mut recv_buf = [0u8; 1500];
 
-    info!("🕳️ NAT Hole Punching sequence sent...");
-    for _ in 0..10 {
-        if !is_running.load(Ordering::SeqCst) { break; }
-        let silence = vec![0i16; target_8k_samples];
-        let payload = encoder.encode(&silence);
-        let header = RtpHeader::new(payload_type, seq, ts, ssrc);
-        let packet = RtpPacket { header, payload };
-        let _ = socket.send_to(&packet.to_bytes(), target);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        seq = seq.wrapping_add(1);
-        ts = ts.wrapping_add(target_8k_samples as u32);
-    }
-
     while is_running.load(Ordering::SeqCst) {
         let input_device = match host.default_input_device() {
             Some(d) => d,
@@ -269,13 +254,40 @@ fn run_hardware_loop(
             }
         };
 
+        // [KRİTİK DÜZELTME]: Android'de default_input_config bazen desteklenmeyen 
+        // kanal (Stereo) atamaya çalışır. Cpal çöker.
+        // Güvenli (Fallback) konfigürasyon arama mantığı eklendi:
         let input_config = match input_device.default_input_config() {
             Ok(c) => c,
-            Err(e) => { error!("Input config error: {}", e); std::thread::sleep(std::time::Duration::from_secs(1)); continue; }
+            Err(e) => { 
+                warn!("Default Input config error: {}. Trying fallback configs...", e); 
+                // Cpal destekli konfigürasyonları ara
+                if let Ok(mut supported_configs) = input_device.supported_input_configs() {
+                    if let Some(config) = supported_configs.next() {
+                        config.with_max_sample_rate()
+                    } else {
+                        return Err(anyhow::anyhow!("No supported input config"));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Cannot query input configs"));
+                }
+            }
         };
+        
         let output_config = match output_device.default_output_config() {
             Ok(c) => c,
-            Err(e) => { error!("Output config error: {}", e); std::thread::sleep(std::time::Duration::from_secs(1)); continue; }
+            Err(e) => { 
+                warn!("Default Output config error: {}. Trying fallback configs...", e); 
+                if let Ok(mut supported_configs) = output_device.supported_output_configs() {
+                    if let Some(config) = supported_configs.next() {
+                        config.with_max_sample_rate()
+                    } else {
+                        return Err(anyhow::anyhow!("No supported output config"));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Cannot query output configs"));
+                }
+            }
         };
 
         let hw_sample_rate_in = input_config.sample_rate().0 as usize;
@@ -286,7 +298,7 @@ fn run_hardware_loop(
         let hw_frame_size = (hw_sample_rate_in * profile.ptime as usize) / 1000;
 
         info!("🔄 (Re)Starting Audio Stream: In: {}Hz {}ch | Out: {}Hz {}ch", hw_sample_rate_in, in_channels, hw_sample_rate_out, out_channels);
-
+        
         let stream_healthy = Arc::new(AtomicBool::new(true));
         let stream_healthy_in = stream_healthy.clone();
         let stream_healthy_out = stream_healthy.clone();
