@@ -131,14 +131,14 @@ fn run_hardware_loop(
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
     
-    // [DÜZELTİLDİ]: Thread'ler arası aktarım için hem üretici hem tüketici Arc<Mutex> içinde korumaya alındı.
+    // Güvenli Bufferlar (E0382 Borrow Checker Hatalarını Çözer)
     let rb_in = HeapRb::<f32>::new(48000); 
     let (mic_prod, mut mic_cons) = rb_in.split();
     let shared_mic_prod = Arc::new(Mutex::new(mic_prod));
 
     let rb_out = HeapRb::<f32>::new(48000);
     let (mut spk_prod, spk_cons) = rb_out.split();
-    let shared_spk_cons = Arc::new(Mutex::new(spk_cons)); // E0382 hatasını çözen kritik satır
+    let shared_spk_cons = Arc::new(Mutex::new(spk_cons));
 
     let profile = AudioProfile::default();
     let codec_type = profile.preferred_audio_codec();
@@ -158,7 +158,7 @@ fn run_hardware_loop(
         let input_device = host.default_input_device().ok_or(anyhow::anyhow!("No input device"))?;
         let output_device = host.default_output_device().ok_or(anyhow::anyhow!("No output device"))?;
 
-        // Android AEC uyumluluğu için Mono zorlaması.
+        // BARESIP Mantığı: Donanımla savaşma, Mono/Stereo ne destekliyorsa kabul et (Çökmeleri engeller)
         let mut input_config: Option<cpal::StreamConfig> = None;
         if let Ok(mut configs) = input_device.supported_input_configs() {
             if let Some(mono_config) = configs.find(|c| c.channels() == 1) {
@@ -185,7 +185,7 @@ fn run_hardware_loop(
         let in_channels = input_stream_config.channels as usize;
         let out_channels = output_config.channels as usize;
         
-        info!("🎙️ Enforced VoIP Audio Config: IN {}Hz {}ch | OUT {}Hz {}ch", hw_sample_rate_in, in_channels, hw_sample_rate_out, out_channels);
+        info!("🎙️ Native Audio Config Accepted: IN {}Hz {}ch | OUT {}Hz {}ch", hw_sample_rate_in, in_channels, hw_sample_rate_out, out_channels);
         
         let hw_frame_size = (hw_sample_rate_in * profile.ptime as usize) / 1000;
         let stream_healthy = Arc::new(AtomicBool::new(true));
@@ -203,6 +203,7 @@ fn run_hardware_loop(
                     if in_channels == 1 {
                         for &s in data { let _ = producer.push(s * gain); }
                     } else {
+                        // Stereo geldiğinde Downmix to Mono (AEC bozulmasını engeller)
                         for frame in data.chunks(in_channels) {
                             let avg = frame.iter().sum::<f32>() / in_channels as f32;
                             let _ = producer.push(avg * gain);
@@ -215,7 +216,7 @@ fn run_hardware_loop(
         // --- OUTPUT STREAM (SPEAKER) ---
         let err_fn_out = { let s = stream_healthy.clone(); move |e| { error!("Spk Error: {}", e); s.store(false, Ordering::SeqCst); } };
         let l_spk = live_speaker_gain.clone();
-        let spk_cons_clone = shared_spk_cons.clone(); // E0382 ÇÖZÜMÜ
+        let spk_cons_clone = shared_spk_cons.clone(); 
         
         let output_stream = output_device.build_output_stream(
             &output_config,
@@ -235,7 +236,7 @@ fn run_hardware_loop(
         input_stream.play()?;
         output_stream.play()?;
 
-        // Anti-Bloat: Döngü başlarken mikrofondaki çöpleri sil. Echo 0ms olsun.
+        // Anti-Bloat: Döngü başlarken mikrofondaki geçmiş saniyelerden kalan çöpleri sil (0ms Echo için)
         let mut flushed_tx = 0;
         while mic_cons.pop().is_some() { flushed_tx += 1; }
         info!("🧹 Ghost Buffers Drained: TX (Mic) {} samples. Ready for real-time.", flushed_tx);

@@ -73,7 +73,6 @@ impl SipEngine {
         }
     }
 
-    // --- SUTS v4.0 COMPLIANT TELEMETRY ---
     async fn send_telemetry(&self, severity: &str, event: &str, message: &str, call_id: &str, attributes: serde_json::Value) {
         let _ = self.event_tx.send(UacEvent::Log(format!("[{}] {}", event, message))).await;
 
@@ -177,10 +176,17 @@ impl SipEngine {
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                             invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Telecom-SDK/4.0".to_string()));
 
+                            // [KRİTİK MİMARİ DÜZELTME]: SDP (Codec) Uyuşmazlığını Engellemek
+                            // RTP Motoru hangi kodekle uyanmışsa (Büyük ihtimalle PCMU), Asterisk'e o SDP'yi gönder.
+                            let profile = sentiric_rtp_core::AudioProfile::default();
+                            let pref_codec = profile.preferred_audio_codec();
+                            let payload_type = pref_codec as u8;
+                            let codec_name = profile.get_by_payload(payload_type).map(|c| c.name).unwrap_or("PCMU");
+
                             let now = chrono::Utc::now().timestamp();
                             let sdp = format!(
-                                "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
-                                now, now, local_ip, local_ip, rtp_port
+                                "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP {} 101\r\na=rtpmap:{} {}/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
+                                now, now, local_ip, local_ip, rtp_port, payload_type, payload_type, codec_name
                             );
                             invite.body = sdp.as_bytes().to_vec();
 
@@ -231,7 +237,6 @@ impl SipEngine {
                             }
                         },
 
-                        // [YENİ EKLENDİ]: Flutter'dan gelen canlı ayar komutunu yakalar
                         ClientCommand::UpdateSettings { mic_gain, speaker_gain, enable_aec } => {
                             if let Some(rtp) = &self.rtp_engine {
                                 tracing::info!("🎛️ Live DSP Update: Mic={:.1}x, Spk={:.1}x, AEC={}", mic_gain, speaker_gain, enable_aec);
