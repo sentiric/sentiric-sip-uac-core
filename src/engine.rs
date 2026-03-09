@@ -3,7 +3,7 @@
 use crate::{CallState, ClientCommand, UacEvent};
 use crate::rtp_engine::RtpEngine;
 use crate::utils::{extract_rtp_target, discover_local_ip};
-use crate::stun::StunClient; // PROAKTİF STUN İÇİN EKLENDİ
+use crate::stun::StunClient;
 use sentiric_sip_core::{parser, Header, HeaderName, Method, SipPacket};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -151,7 +151,6 @@ impl SipEngine {
         let rtp_port = rtp_socket_std.local_addr().unwrap().port();
 
         // [MİMARİ DÜZELTME]: PROAKTİF STUN KEŞFİ
-        // Baresip gibi, iletişime başlamadan önce dış dünyadaki yansımamızı öğreniyoruz.
         let mut public_sip_ip = local_ip.clone();
         let mut public_sip_port = sip_port;
         
@@ -170,6 +169,10 @@ impl SipEngine {
         let mut current_from_tag = String::new();
         let mut current_to_tag = String::new();
         let mut current_cseq = 0;
+
+        // [KRİTİK]: Baresip uyumluluğu için aktif NAT değişkenleri
+        let mut active_contact_ip = public_sip_ip.clone();
+        let mut active_contact_port = public_sip_port;
 
         let mut last_invite_packet: Option<Vec<u8>> = None;
         let mut retransmit_interval = tokio::time::interval(Duration::from_millis(500));
@@ -194,28 +197,45 @@ impl SipEngine {
                             current_from_tag = format!("tag-{:x}", rand::random::<u16>());
                             current_cseq = 1;
 
+                            // --- BARESIP-LIKE AKILLI NAT (INTELLIGENT ROUTING) ---
+                            // Hedef VPN veya LAN ise STUN IP'sini çöpe atıp fiziksel IP'yi kullanıyoruz.
+                            active_contact_ip = public_sip_ip.clone();
+                            active_contact_port = public_sip_port;
+
+                            if let Ok(dummy) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                                if dummy.connect(target_addr).is_ok() {
+                                    if let Ok(local_addr) = dummy.local_addr() {
+                                        let lip = local_addr.ip().to_string();
+                                        // 100.x = Tailscale/VPN, 10.x / 192.168.x / 172.x = LAN
+                                        if target_ip.starts_with("100.") || target_ip.starts_with("10.") || target_ip.starts_with("192.168.") || target_ip.starts_with("172.") {
+                                            active_contact_ip = lip;
+                                            active_contact_port = sip_port; // Orijinal fiziksel port
+                                            let _ = self.event_tx.try_send(UacEvent::Log(format!("🛡️ VPN/LAN Detected. STUN bypassed -> SDP set to {}", active_contact_ip)));
+                                        }
+                                    }
+                                }
+                            }
+
                             let mut invite = SipPacket::new_request(Method::Invite, format!("sip:{}@{}:{}", to_user, target_ip, target_port));
                             let branch = sentiric_sip_core::utils::generate_branch_id();
 
-                            // [KRİTİK]: Baresip uyumluluğu - STUN IP'si kullanılıyor
-                            invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", public_sip_ip, public_sip_port, branch)));
-                            invite.headers.push(Header::new(HeaderName::From, format!("<sip:{}@100.124.62.108>;tag={}", from_user, current_from_tag))); // Domain spoof for lab test bypass
+                            // [KRİTİK]: Tüm başlıklar active_contact_ip ile yapılandırıldı.
+                            invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", active_contact_ip, active_contact_port, branch)));
+                            invite.headers.push(Header::new(HeaderName::From, format!("<sip:{}@{}>;tag={}", from_user, target_ip, current_from_tag)));
                             invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}@{}>", to_user, target_ip)));
                             invite.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                             invite.headers.push(Header::new(HeaderName::CSeq, format!("{} INVITE", current_cseq)));
-                            
-                            // [KRİTİK]: Asterisk 7777 testinde BYE paketini buraya atacak!
-                            invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", from_user, public_sip_ip, public_sip_port)));
+                            invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", from_user, active_contact_ip, active_contact_port)));
                             
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                             invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/3.0".to_string()));
                             invite.headers.push(Header::new(HeaderName::Allow, "INVITE, ACK, BYE, CANCEL, OPTIONS".to_string()));
 
                             let now = chrono::Utc::now().timestamp();
-                            // SDP connection adresi de public ip olmalı, Asterisk Strict Latching ile RTP portunu bulacak.
+                            // Asterisk Strict Latching sorunu çözüldü.
                             let sdp = format!(
                                 "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
-                                now, now, public_sip_ip, public_sip_ip, rtp_port
+                                now, now, active_contact_ip, active_contact_ip, rtp_port
                             );
                             invite.body = sdp.as_bytes().to_vec();
 
@@ -237,14 +257,14 @@ impl SipEngine {
                                     let mut bye = SipPacket::new_request(Method::Bye, format!("sip:{}", target));
                                     let branch = sentiric_sip_core::utils::generate_branch_id();
                                     
-                                    bye.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", public_sip_ip, public_sip_port, branch)));
+                                    bye.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", active_contact_ip, active_contact_port, branch)));
                                     bye.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
                                     bye.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
                                     bye.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                                     
                                     current_cseq += 1;
                                     bye.headers.push(Header::new(HeaderName::CSeq, format!("{} BYE", current_cseq)));
-                                    bye.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", public_sip_ip, public_sip_port)));
+                                    bye.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", active_contact_ip, active_contact_port)));
 
                                     let packet_bytes = bye.to_bytes();
                                     let _ = self.event_tx.try_send(UacEvent::Log("⬆️ BYE sent".to_string()));
@@ -280,9 +300,8 @@ impl SipEngine {
                                  let _ = self.event_tx.try_send(UacEvent::Log("🏁 Server closed connection (BYE). Hanging up!".to_string()));
                                  self.send_telemetry("INFO", "REMOTE_HANGUP", "Received BYE from Server", &current_call_id, json!({})).await;
                                  
-                                 // [KRİTİK]: Asterisk 7777 testi için BYE isteğine 200 OK ile yanıt vermeliyiz.
                                  let mut ok_resp = SipPacket::create_response_for(&packet, 200, "OK".to_string());
-                                 ok_resp.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", public_sip_ip, public_sip_port)));
+                                 ok_resp.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", active_contact_ip, active_contact_port)));
                                  ok_resp.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/3.0".to_string()));
                                  
                                  let _ = sip_socket.send_to(&ok_resp.to_bytes(), src).await;
@@ -301,15 +320,15 @@ impl SipEngine {
                          // 2. SUNUCUDAN GELEN CEVAPLAR (RESPONSES)
                          let status_code = packet.status_code;
                          
-                         // [GÜVENLİK AĞI]: STUN başarısız olduysa Via üzerinden reaktif öğrenmeye devam et
+                         // [GÜVENLİK AĞI]: Reactive NAT Update - Asterisk ne gördüyse onu kullan
                          if status_code >= 100 && self.state == CallState::Dialing {
                              last_invite_packet = None;
                              if let Some(via) = packet.get_header_value(HeaderName::Via) {
-                                 let (ip, port) = extract_public_addr_from_via(via, &public_sip_ip, public_sip_port);
-                                 if ip != public_sip_ip || port != public_sip_port {
+                                 let (ip, port) = extract_public_addr_from_via(via, &active_contact_ip, active_contact_port);
+                                 if ip != active_contact_ip || port != active_contact_port {
                                      let _ = self.event_tx.try_send(UacEvent::Log(format!("🌍 Reactive NAT Update: {}:{}", ip, port)));
-                                     public_sip_ip = ip;
-                                     public_sip_port = port;
+                                     active_contact_ip = ip;
+                                     active_contact_port = port;
                                  }
                              }
                          }
@@ -323,22 +342,20 @@ impl SipEngine {
                              
                              if let Some(rtp_target) = extract_rtp_target(&packet.body, &src.ip().to_string()) {
                                  self.send_telemetry("INFO", "SDP_PARSED", "Media target locked", &current_call_id, json!({"target": rtp_target.to_string()})).await;
-                                 
-                                 // [KRİTİK]: 8888 ve 9999 testleri için RTP anında tetikleniyor.
                                  if let Some(rtp) = &self.rtp_engine { rtp.start(rtp_target); }
                              }
                              
                              let mut ack = SipPacket::new_request(Method::Ack, format!("sip:{}", src));
                              let branch = sentiric_sip_core::utils::generate_branch_id();
 
-                             ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", public_sip_ip, public_sip_port, branch)));
+                             ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", active_contact_ip, active_contact_port, branch)));
                              if let Some(from) = packet.get_header_value(HeaderName::From) { 
                                  ack.headers.push(Header::new(HeaderName::From, from.clone())); 
                              }
                              ack.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
                              ack.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                              ack.headers.push(Header::new(HeaderName::CSeq, format!("{} ACK", current_cseq)));
-                             ack.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", public_sip_ip, public_sip_port)));
+                             ack.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", active_contact_ip, active_contact_port)));
                              ack.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/3.0".to_string()));
                              
                              if let Some(target) = current_target {
