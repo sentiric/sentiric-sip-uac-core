@@ -78,4 +78,11 @@ impl TelecomClient {
         self.command_tx.send(ClientCommand::SetMute { muted }).await.map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
     }
+
+    // YENİ: Otomasyon botlarının DTMF basabilmesi için dışa açılan metod
+    pub async fn send_dtmf(&self, key: char) -> anyhow::Result<()> {
+        self.command_tx.send(ClientCommand::SendDtmf { key }).await
+            .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
+        Ok(())
+    }
 }
