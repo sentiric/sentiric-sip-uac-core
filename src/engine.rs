@@ -288,6 +288,14 @@ impl SipEngine {
                                 rtp.trigger_dtmf(key);
                                 let _ = self.event_tx.try_send(UacEvent::Log(format!("🎹 In-Band DTMF Injecting: {}", key)));
                             }
+                        },      
+                                                // YENİ: Mute Komutu Yakalayıcı
+                        ClientCommand::SetMute { muted } => {
+                            if let Some(rtp) = &self.rtp_engine {
+                                rtp.set_mute(muted);
+                                let state_str = if muted { "MUTED" } else { "UNMUTED" };
+                                let _ = self.event_tx.try_send(UacEvent::Log(format!("🔇 Mic state changed: {}", state_str)));
+                            }
                         }                        
                     }
                 },

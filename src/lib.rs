@@ -4,6 +4,7 @@ pub mod engine;
 pub mod rtp_engine;
 pub mod utils;
 pub mod stun;
+pub mod media; // YENİ: Medya Soyutlama Katmanı
 
 use tokio::sync::mpsc;
 
@@ -38,9 +39,11 @@ pub enum ClientCommand {
         speaker_gain: f32,
         enable_aec: bool,
     },
-    // [YENİ]: DTMF Tuş Komutu
     SendDtmf {
         key: char,
+    },
+    SetMute {
+        muted: bool,
     },
 }
 
@@ -57,21 +60,22 @@ impl TelecomClient {
             engine.run().await;
         });
 
-        Self {
-            command_tx: cmd_tx,
-        }
+        Self { command_tx: cmd_tx }
     }
 
     pub async fn start_call(&self, target_ip: String, target_port: u16, to_user: String, from_user: String) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::StartCall { 
-            target_ip, target_port, to_user, from_user 
-        }).await.map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
+        self.command_tx.send(ClientCommand::StartCall { target_ip, target_port, to_user, from_user }).await.map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
     }
 
     pub async fn end_call(&self) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::EndCall).await
-            .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
+        self.command_tx.send(ClientCommand::EndCall).await.map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
+        Ok(())
+    }
+    
+    // YENİ: Mute API
+    pub async fn set_mute(&self, muted: bool) -> anyhow::Result<()> {
+        self.command_tx.send(ClientCommand::SetMute { muted }).await.map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
     }
 }
