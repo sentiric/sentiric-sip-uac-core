@@ -281,7 +281,14 @@ impl SipEngine {
                             if let Some(rtp) = &self.rtp_engine {
                                 rtp.update_gains(mic_gain, speaker_gain);
                             }
-                        }
+                        },
+
+                        ClientCommand::SendDtmf { key } => {
+                            if let Some(rtp) = &self.rtp_engine {
+                                rtp.trigger_dtmf(key);
+                                let _ = self.event_tx.try_send(UacEvent::Log(format!("🎹 In-Band DTMF Injecting: {}", key)));
+                            }
+                        }                        
                     }
                 },
 
