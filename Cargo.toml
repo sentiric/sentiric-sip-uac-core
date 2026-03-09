@@ -10,7 +10,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 # --- THE IRON CORE ---
-sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.5.1" }
+sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.6.0" }
 sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.5.6" }
 
 # --- Async & Network ---
